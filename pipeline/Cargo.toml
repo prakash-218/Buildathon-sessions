@@ -1,0 +1,20 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+parquet = { version = "55", default-features = false }
+rayon = "1"
+rustc-hash = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+debug = false

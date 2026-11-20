@@ -1,0 +1,5 @@
+# Allowlist: the image only needs the pipeline's source.
+*
+!pipeline/Cargo.toml
+!pipeline/Cargo.lock
+!pipeline/src/

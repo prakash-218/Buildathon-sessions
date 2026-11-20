@@ -5,6 +5,7 @@
 /data/
 /out/
 /out-*/
+/ref-*/
 
 # Local downloads and the unmodified starters (originals are on the track page).
 /downloads/
