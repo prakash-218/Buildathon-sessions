@@ -1,0 +1,20 @@
+# Datasets are mounted at run time and must stay out of the repo (50 MB limit).
+/dev/
+/dev-*/
+!/dev-answer/
+/data/
+/out/
+/out-*/
+
+# Local downloads and the unmodified starters (originals are on the track page).
+/downloads/
+/starter-pyspark/
+/starter-duckdb/
+/starter-polars/
+
+# Build output and environments.
+/bin/
+target/
+.venv/
+__pycache__/
+*.pyc

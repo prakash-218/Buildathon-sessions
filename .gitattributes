@@ -1,0 +1,9 @@
+# Fixture and answer files are exact bytes: some lines end in \r\n on purpose
+# (fixture E20). Never let Git convert their line endings.
+fixtures/** -text
+dev-answer/** -text
+*.csv -text
+
+# Shell scripts must keep LF to run inside Linux containers.
+*.sh text eol=lf
+Dockerfile text eol=lf
