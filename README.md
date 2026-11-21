@@ -6,7 +6,7 @@ Our entry for the Builders Buildathon Databricks track: turn messy click-stream 
 
 | Path | What |
 | --- | --- |
-| `Dockerfile` | What the scorer builds: the Rust pipeline on `debian:bookworm-slim`. |
+| `Dockerfile` | What the scorer builds: one static Rust binary in a `FROM scratch` image (about 3 MB). |
 | `pipeline/` | The fast pipeline (Rust, rayon, parquet). |
 | `reference/reference.py` | Slow, literal Python implementation of every rule. The test oracle. |
 | `rules.md` | The track's rules. Where anything disagrees with it, it wins. |
@@ -24,7 +24,9 @@ Our entry for the Builders Buildathon Databricks track: turn messy click-stream 
 3. Events: every copy is parsed and validated in parallel. A valid copy's 24-byte payload is written once, straight into its person's shard; every copy also sends (`event_id`, `ingest_ts`, payload location) to its `event_id` shard. Dedup keeps the copy with the smallest `ingest_ts` per ID and marks every other copy's payload dead in place (each payload belongs to one `event_id` shard, so no two threads write it). Canonical `p<digits>` product IDs are looked up in a small array.
 4. Clicks: validated and sharded by person. No dedup: copies are identical, so they cannot change a credit or an assist.
 5. Per person (dead payloads skipped): sort, split sessions on gaps over 30 min, credit each session with a two-pointer over the clicks, and count assists by merging each campaign's `[t, t + 7 days]` windows into intervals.
-6. Write the tables as Parquet, one file per thread, without dictionaries or statistics.
+6. Write the tables as Parquet, one file per thread, without dictionaries or statistics. Then hand the big buffers and input mappings back with `madvise(MADV_DONTNEED)` on all threads and exit, since the kernel's teardown at exit is single-threaded.
+
+The scanner prefetches its input 1 KB ahead.
 
 Memory comes from mimalloc with `MIMALLOC_PURGE_DELAY=-1` (set in the Dockerfile), and each worker reuses its hash maps and buffers across shards, so later phases reuse memory instead of faulting in fresh pages.
 
@@ -37,7 +39,7 @@ Memory comes from mimalloc with `MIMALLOC_PURGE_DELAY=-1` (set in the Dockerfile
 | Seeds 2, 3 (1M events) and 11 (5M events) vs the reference | exact match |
 | 20M events (seed 7), local laptop, 8 CPUs | 4.3 to 4.8 s in the container; about 16k page faults |
 
-The track's baseline is 171.91 s. Practice board: a6ee49b (first version) 4.09 s; 581d3f3 (AVX2 parser, packed keys) 2.07 s; f1a698d (parallel links, mimalloc, buffer reuse) 1.64 s.
+The track's baseline is 171.91 s. Practice board: a6ee49b (first version) 4.09 s; 581d3f3 (AVX2 parser, packed keys) 2.07 s; f1a698d (parallel links, mimalloc, buffer reuse) 1.64 s; a17ca33 (write-once events, renamed-ID filter) 1.51 s; a50022a (SWAR timestamps) 1.41 s.
 
 Local wall times on a laptop under WSL2 swing by ±30%, so page faults (`perf stat -e page-faults`, deterministic) and profiles are better guides than single timings.
 

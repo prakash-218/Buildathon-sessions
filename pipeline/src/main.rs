@@ -295,6 +295,13 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
 
     let mut base = 0usize;
     while base < n {
+        // Ask for the input 1 KB ahead, so the stream arrives before the scanner
+        // needs it. A prefetch never faults, so running past the end is harmless.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(d.as_ptr().wrapping_add(base + 1024) as *const i8);
+        }
         let (nl, cm, qt) = masks(d, base);
         let mut s = nl | cm | qt;
         while s != 0 {
@@ -1150,10 +1157,38 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         || write_campaign(&cd.join("part-00000.parquet"), &camp_tot, &camp_names, ncamp, ndays, day0),
     );
     log(t0, &format!("wrote {nrows} user rows in {} files", groups.len()));
-    // The outputs are written and closed. Exit now instead of freeing gigabytes of
-    // buffers one by one; the kernel reclaims everything at once.
+    // The outputs are written and closed. Hand the big buffers and the input
+    // mappings back on all threads, then exit: the kernel's own teardown at exit
+    // is single-threaded, and with gigabytes mapped it is a visible cost.
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for c in pays.iter() {
+        for v in c {
+            regions.push((v.as_ptr() as usize, std::mem::size_of_val(&v[..])));
+        }
+    }
+    for c in clicks.iter() {
+        for v in c {
+            regions.push((v.as_ptr() as usize, std::mem::size_of_val(&v[..])));
+        }
+    }
+    for b in inp.events.iter().chain(&inp.clicks).chain(&inp.links) {
+        regions.push((b.as_ptr() as usize, b.len()));
+    }
+    regions.par_iter().with_min_len(64).for_each(|&(p, len)| release(p, len));
     log(t0, "done");
     std::process::exit(0);
+}
+
+/// madvise(MADV_DONTNEED) the whole pages inside `[p, p + len)`. Only called on
+/// memory nothing will read again (the process exits right after).
+fn release(p: usize, len: usize) {
+    const PAGE: usize = 4096;
+    let (start, end) = ((p + PAGE - 1) & !(PAGE - 1), (p + len) & !(PAGE - 1));
+    if end > start {
+        // SAFETY: the range lies inside a live allocation or mapping, and nothing
+        // touches it again before exit; DONTNEED only drops the pages.
+        unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+    }
 }
 
 /// Buffers reused from shard to shard, so each worker allocates (and the
