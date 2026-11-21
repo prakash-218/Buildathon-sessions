@@ -519,99 +519,106 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     let ev_chunks = make_chunks(&inp.events, target);
     let ln_chunks = make_chunks(&inp.links, target);
 
-    // ---- Recover the keys from samples, and size the dense arrays.
-    let ev_bytes: usize = inp.events.iter().map(|b| b.len()).sum();
-    let step = (ev_chunks.len() / 96).max(1);
-    let samples: Vec<Vec<(Option<u64>, Option<u64>)>> = ev_chunks
-        .par_iter()
-        .step_by(step)
-        .map(|c| {
-            let d = head(c, 48 << 10);
-            let mut v = Vec::new();
-            scan::<7, _>(d, c.skip_first, |fl| {
-                let e = (fl[0].e() > fl[0].s() && d[fl[0].s()] == b'e').then(|| b36(d, fl[0].s() + 1, fl[0].e())).flatten();
-                let u = (fl[1].e() > fl[1].s() && d[fl[1].s()] == b'u').then(|| b36(d, fl[1].s() + 1, fl[1].e())).flatten();
-                v.push((e, u));
-            });
-            v
-        })
-        .collect();
-    let sampled_bytes: usize = ev_chunks.iter().step_by(step).map(|c| head(c, 48 << 10).len()).sum();
-    let ev_sample: Vec<(Option<u64>, Option<u64>)> = samples.into_iter().flatten().collect();
-    log(t0, &format!("sampled {} event rows", ev_sample.len()));
-    let rows_est = if ev_sample.is_empty() { ev_bytes / 40 } else { ev_bytes / (sampled_bytes / ev_sample.len()).max(1) };
-    let pmax = ((rows_est / 24 + 4096) as u64).min(1 << 22);
-    let imax = (rows_est + rows_est / 8 + 4096) as u64;
-    if imax >= 1 << 31 {
-        return false;
-    }
-    let nsh = ((imax >> SH) + 1) as usize;
-
-    let mut link_pairs: Vec<(u64, u64)> = Vec::new();
-    for c in &ln_chunks {
-        let d = head(c, 256 << 10);
-        scan::<2, _>(d, c.skip_first, |fl| {
-            let dec = |f: Fd| (f.e() > f.s() && d[f.s()] == b'u').then(|| b36(d, f.s() + 1, f.e())).flatten();
-            if let (Some(a), Some(b)) = (dec(fl[0]), dec(fl[1])) {
-                if a != b {
-                    link_pairs.push((a, b));
-                }
-            }
-        });
-        if link_pairs.len() >= 4096 {
-            break;
-        }
-    }
-    // Scored on at most 2048 IDs: every bit no pair fixes doubles the candidates.
-    let users: Vec<u64> =
-        link_pairs.iter().flat_map(|&(a, b)| [a, b]).chain(ev_sample.iter().filter_map(|s| s.1)).step_by(7).take(2048).collect();
-    let user_score = |k: u64| {
-        let ok = users
-            .iter()
-            .filter(|&&y| {
-                let v = unscramble(y, k);
-                (v < KIOSK && (v >> 9) < pmax) || (v >= KIOSK && v - KIOSK < 4096)
+    // ---- The keys (from samples) and the link components do not depend on
+    // each other: they run side by side.
+    let keys = || -> Option<(u64, u64, usize, u64, u64, usize)> {
+        // ---- Recover the keys from samples, and size the dense arrays.
+        let ev_bytes: usize = inp.events.iter().map(|b| b.len()).sum();
+        let step = (ev_chunks.len() / 96).max(1);
+        let samples: Vec<Vec<(Option<u64>, Option<u64>)>> = ev_chunks
+            .par_iter()
+            .step_by(step)
+            .map(|c| {
+                let d = head(c, 48 << 10);
+                let mut v = Vec::new();
+                scan::<7, _>(d, c.skip_first, |fl| {
+                    let e = (fl[0].e() > fl[0].s() && d[fl[0].s()] == b'e').then(|| b36(d, fl[0].s() + 1, fl[0].e())).flatten();
+                    let u = (fl[1].e() > fl[1].s() && d[fl[1].s()] == b'u').then(|| b36(d, fl[1].s() + 1, fl[1].e())).flatten();
+                    v.push((e, u));
+                });
+                v
             })
-            .count();
-        ok as f64 / users.len().max(1) as f64
-    };
-    let ukey = solve_key(&link_pairs, 8, user_score).filter(|&(_, s)| s >= 0.9).map(|(k, _)| k);
-    log(t0, "user key");
-    let ekey = ukey.and_then(|uk| {
-        // Two events of one ordinary person have numbers less than their event
-        // count apart. People seen more than 4 times in the sample are skipped:
-        // the whales, whose numbers are far apart.
-        let mut by_person: Vec<(u64, u64)> = ev_sample
-            .iter()
-            .filter_map(|&(e, u)| Some((unscramble(u?, uk) >> 9, e?)))
             .collect();
-        by_person.sort_unstable();
-        let mut pairs = Vec::new();
-        let mut k = 0;
-        while k < by_person.len() {
-            let mut r = k + 1;
-            while r < by_person.len() && by_person[r].0 == by_person[k].0 {
-                r += 1;
-            }
-            if r - k <= 4 {
-                for j in k + 1..r {
-                    pairs.push((by_person[j - 1].1, by_person[j].1));
-                }
-            }
-            k = r;
+        let sampled_bytes: usize = ev_chunks.iter().step_by(step).map(|c| head(c, 48 << 10).len()).sum();
+        let ev_sample: Vec<(Option<u64>, Option<u64>)> = samples.into_iter().flatten().collect();
+        log(t0, &format!("sampled {} event rows", ev_sample.len()));
+        let rows_est = if ev_sample.is_empty() { ev_bytes / 40 } else { ev_bytes / (sampled_bytes / ev_sample.len()).max(1) };
+        let pmax = ((rows_est / 24 + 4096) as u64).min(1 << 22);
+        let imax = (rows_est + rows_est / 8 + 4096) as u64;
+        if imax >= 1 << 31 {
+            return None;
         }
-        let es: Vec<u64> = ev_sample.iter().filter_map(|s| s.0).step_by(7).take(2048).collect();
-        let score = |k: u64| es.iter().filter(|&&y| unscramble(y, k) < imax).count() as f64 / es.len().max(1) as f64;
-        solve_key(&pairs, 64, score).filter(|&(_, s)| s >= 0.9).map(|(k, _)| k)
-    });
-    phase(t0, 2, &format!("keys: user {ukey:?}, event {ekey:?}; ~{rows_est} event rows, {nsh} shards"));
-    if (ukey.is_none() || ekey.is_none()) && !force {
-        return false;
-    }
-    let (ukey, ekey) = (ukey.unwrap_or(0), ekey.unwrap_or(0));
+        let nsh = ((imax >> SH) + 1) as usize;
+
+        let mut link_pairs: Vec<(u64, u64)> = Vec::new();
+        for c in &ln_chunks {
+            let d = head(c, 256 << 10);
+            scan::<2, _>(d, c.skip_first, |fl| {
+                let dec = |f: Fd| (f.e() > f.s() && d[f.s()] == b'u').then(|| b36(d, f.s() + 1, f.e())).flatten();
+                if let (Some(a), Some(b)) = (dec(fl[0]), dec(fl[1])) {
+                    if a != b {
+                        link_pairs.push((a, b));
+                    }
+                }
+            });
+            if link_pairs.len() >= 4096 {
+                break;
+            }
+        }
+        // Scored on at most 2048 IDs: every bit no pair fixes doubles the candidates.
+        let users: Vec<u64> =
+            link_pairs.iter().flat_map(|&(a, b)| [a, b]).chain(ev_sample.iter().filter_map(|s| s.1)).step_by(7).take(2048).collect();
+        let user_score = |k: u64| {
+            let ok = users
+                .iter()
+                .filter(|&&y| {
+                    let v = unscramble(y, k);
+                    (v < KIOSK && (v >> 9) < pmax) || (v >= KIOSK && v - KIOSK < 4096)
+                })
+                .count();
+            ok as f64 / users.len().max(1) as f64
+        };
+        let ukey = solve_key(&link_pairs, 8, user_score).filter(|&(_, s)| s >= 0.9).map(|(k, _)| k);
+        log(t0, "user key");
+        let ekey = ukey.and_then(|uk| {
+            // Two events of one ordinary person have numbers less than their event
+            // count apart. People seen more than 4 times in the sample are skipped:
+            // the whales, whose numbers are far apart.
+            let mut by_person: Vec<(u64, u64)> = ev_sample
+                .iter()
+                .filter_map(|&(e, u)| Some((unscramble(u?, uk) >> 9, e?)))
+                .collect();
+            by_person.sort_unstable();
+            let mut pairs = Vec::new();
+            let mut k = 0;
+            while k < by_person.len() {
+                let mut r = k + 1;
+                while r < by_person.len() && by_person[r].0 == by_person[k].0 {
+                    r += 1;
+                }
+                if r - k <= 4 {
+                    for j in k + 1..r {
+                        pairs.push((by_person[j - 1].1, by_person[j].1));
+                    }
+                }
+                k = r;
+            }
+            let es: Vec<u64> = ev_sample.iter().filter_map(|s| s.0).step_by(7).take(2048).collect();
+            let score = |k: u64| es.iter().filter(|&&y| unscramble(y, k) < imax).count() as f64 / es.len().max(1) as f64;
+            solve_key(&pairs, 64, score).filter(|&(_, s)| s >= 0.9).map(|(k, _)| k)
+        });
+        phase(t0, 2, &format!("keys: user {ukey:?}, event {ekey:?}; ~{rows_est} event rows, {nsh} shards"));
+        if (ukey.is_none() || ekey.is_none()) && !force {
+            return None;
+        }
+        Some((ukey.unwrap_or(0), ekey.unwrap_or(0), rows_est, pmax, imax, nsh))
+    };
+    let (keys, comps) = rayon::join(keys, || link_components::<u64>(inp, target, threads));
+    let Some((ukey, ekey, rows_est, pmax, imax, nsh)) = keys else { return false };
+    let _ = rows_est;
 
     // ---- Links: who is linked to whom, then what that means per dense person.
-    let Some(comps) = link_components::<u64>(inp, target, threads) else { return false };
+    let Some(comps) = comps else { return false };
     let nid = comps.roots.len();
     let names: Vec<u64> = comps.name.iter().map(|n| n.unwrap_or(0)).collect();
     // Every linked ID: (dense user number, root) or (packed key, root).
