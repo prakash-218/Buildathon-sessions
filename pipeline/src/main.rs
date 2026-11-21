@@ -174,6 +174,14 @@ fn product_number(s: &[u8]) -> Option<usize> {
     Some(v)
 }
 
+/// Room for one shard's share of `bytes` of input at `per_line` bytes a line:
+/// the mean plus 4 standard deviations, so shard vectors rarely outgrow it
+/// (each growth copies the whole vector).
+fn shard_cap(bytes: usize, per_line: usize) -> usize {
+    let m = bytes / per_line / NB;
+    m + 4 * (m as f64).sqrt() as usize + 16
+}
+
 fn new_map<K, V>(cap: usize) -> FxHashMap<K, V> {
     FxHashMap::with_capacity_and_hasher(cap, FxBuildHasher)
 }
@@ -387,9 +395,138 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
+/// Days from 1970-01-01 to the 1st of each month of 1970..2100, built at compile time.
+const TABLE_Y0: i64 = 1970;
+const TABLE_YEARS: usize = 130;
+const MONTH_START: [i32; TABLE_YEARS * 12] = {
+    let mut t = [0i32; TABLE_YEARS * 12];
+    let mut i = 0;
+    while i < TABLE_YEARS * 12 {
+        let (y, m) = (TABLE_Y0 + (i / 12) as i64, (i % 12) as i64 + 1);
+        let yy = if m <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let mp = if m > 2 { m - 3 } else { m + 9 };
+        let doy = (153 * mp + 2) / 5;
+        t[i] = (era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468) as i32;
+        i += 1;
+    }
+    t
+};
+
+/// True if all 8 bytes of `w` are ASCII digits. Sound: a non-digit byte always
+/// sets its own top bit in `x | y` (borrows and carries only start at bytes
+/// that already fail), so a `true` is never wrong.
+#[inline(always)]
+fn digits8(w: u64) -> bool {
+    let x = w.wrapping_sub(0x3030_3030_3030_3030);
+    let y = w.wrapping_add(0x4646_4646_4646_4646);
+    (x | y) & 0x8080_8080_8080_8080 == 0
+}
+
+#[inline(always)]
+fn le64(s: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+}
+
+/// Fast path for `YYYY-MM-DDTHH:MM:SS` + `Z` (F1) or `±HH:MM` (F2): checks all
+/// digits and separators a word at a time. Returns None whenever it is not
+/// sure, and then the exact slow path decides, so it never accepts anything
+/// the slow path would reject, and computes the same value.
+#[inline(always)]
+fn parse_iso_fast(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n != 20 && n != 25 {
+        return None;
+    }
+    let w0 = le64(s, 0); // YYYY-MM-
+    let w1 = le64(s, 8); // DDTHH:MM
+    let w2 = le64(s, 12); // HH:MM:SS + byte 19
+    const S0: u64 = 0xff << 32 | 0xff << 56; // bytes 4, 7
+    const S1: u64 = 0xff << 16 | 0xff << 40; // bytes 10, 13
+    const ZERO: u64 = 0x3030_3030_3030_3030;
+    if w0 & S0 != (b'-' as u64) << 32 | (b'-' as u64) << 56
+        || w1 & S1 != (b'T' as u64) << 16 | (b':' as u64) << 40
+        || s[16] != b':'
+    {
+        return None;
+    }
+    let k2: u64 = 0xffff << 40; // bytes 17, 18 of the string
+    // Separators replaced by '0', so every byte is a digit and subtracting '0'
+    // cannot borrow across bytes.
+    let (d0, d1, d2) = (w0 & !S0 | ZERO & S0, w1 & !S1 | ZERO & S1, w2 & k2 | ZERO & !k2);
+    if !digits8(d0) || !digits8(d1) || !digits8(d2) {
+        return None;
+    }
+    let x0 = (d0 - ZERO).to_le_bytes();
+    let x1 = (d1 - ZERO).to_le_bytes();
+    let x2 = (d2 - ZERO).to_le_bytes();
+    let y = x0[0] as i64 * 1000 + x0[1] as i64 * 100 + x0[2] as i64 * 10 + x0[3] as i64;
+    let mo = x0[5] as i64 * 10 + x0[6] as i64;
+    let d = x1[0] as i64 * 10 + x1[1] as i64;
+    let h = x1[3] as i64 * 10 + x1[4] as i64;
+    let mi = x1[6] as i64 * 10 + x1[7] as i64;
+    let se = x2[5] as i64 * 10 + x2[6] as i64;
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let off = if n == 20 {
+        if s[19] != b'Z' {
+            return None;
+        }
+        0
+    } else {
+        let (sign, a, b, c, e) = (s[19], s[20], s[21], s[23], s[24]);
+        if (sign != b'+' && sign != b'-') || s[22] != b':' {
+            return None;
+        }
+        let (a, b, c, e) = (a.wrapping_sub(b'0'), b.wrapping_sub(b'0'), c.wrapping_sub(b'0'), e.wrapping_sub(b'0'));
+        if a > 9 || b > 9 || c > 9 || e > 9 {
+            return None;
+        }
+        let (oh, om) = (a as i64 * 10 + b as i64, c as i64 * 10 + e as i64);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let o = (oh * 60 + om) * 60_000;
+        if sign == b'-' { -o } else { o }
+    };
+    let days = if (TABLE_Y0..TABLE_Y0 + TABLE_YEARS as i64).contains(&y) {
+        MONTH_START[(y - TABLE_Y0) as usize * 12 + mo as usize - 1] as i64 + d - 1
+    } else {
+        days_from_civil(y, mo, d)
+    };
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + se * 1000 - off)
+}
+
 /// F1 / F2 / F3 -> epoch ms. None for any other form. A huge F3 saturates.
 #[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    if let Some(v) = parse_iso_fast(s) {
+        return Some(v);
+    }
+    if n <= 18 {
+        // Shorter than F1, so only F3 can be valid; at most 18 digits cannot overflow.
+        let mut v: i64 = 0;
+        for &c in s {
+            let dgt = c.wrapping_sub(b'0');
+            if dgt > 9 {
+                return None;
+            }
+            v = v * 10 + dgt as i64;
+        }
+        return Some(v);
+    }
+    parse_ts_slow(s)
+}
+
+/// The exact, unhurried parser: every rule of the three forms.
+#[inline(never)]
+fn parse_ts_slow(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 0 {
         return None;
@@ -819,7 +956,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         .enumerate()
         .map(|(ci, c)| {
             let d = c.data;
-            let cap = d.len() / 70 / NB + 4;
+            let cap = shard_cap(d.len(), 72);
             let mut drec: Vec<Vec<DRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
             let mut pay: Vec<Vec<PRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
             scan::<7, _>(d, c.skip_first, |fl| {
@@ -879,7 +1016,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         .par_iter()
         .map(|c| {
             let d = c.data;
-            let cap = d.len() / 45 / NB + 4;
+            let cap = shard_cap(d.len(), 46);
             let mut out: Vec<Vec<CRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
             scan::<4, _>(d, c.skip_first, |fl| {
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
@@ -921,8 +1058,11 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             unsafe { (*(ptrs[c][p].0 as *mut PRec<K>).add(i)).ts = DEAD };
         }
     };
+    // Rayon may call the init once per work split, not once per thread, so start
+    // each map at a shard's full size: growing from empty rehashes it many times.
+    let per_shard = drecs.iter().map(|c| c.iter().map(|v| v.len()).sum::<usize>()).sum::<usize>() / NB;
     (0..NB).into_par_iter().for_each_init(
-        || new_map::<K, (i64, u64)>(0), // reused from shard to shard
+        || new_map::<K, (i64, u64)>(per_shard + per_shard / 4 + 64), // reused from shard to shard
         |best, b| {
             let n: usize = drecs.iter().map(|c| c[b].len()).sum();
             best.clear();
@@ -1396,4 +1536,84 @@ fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_names: &[(&[u8], &[u8])], 
         rg.close().unwrap();
     }
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small deterministic PRNG (xorshift64*), so the test needs no crates.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn candidate(r: &mut Rng) -> Vec<u8> {
+        let year = match r.below(4) {
+            0 => r.below(10_000),
+            1 => 1969 + r.below(4),
+            2 => 2096 + r.below(8),
+            _ => 2024 + r.below(6),
+        };
+        let mut s = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            year,
+            r.below(14),
+            r.below(33),
+            r.below(26),
+            r.below(62),
+            r.below(62)
+        )
+        .into_bytes();
+        match r.below(3) {
+            0 => s.push(b'Z'),
+            1 => s.extend(format!("{}{:02}:{:02}", if r.below(2) == 0 { '+' } else { '-' }, r.below(26), r.below(62)).bytes()),
+            _ => {
+                s = (0..1 + r.below(25)).map(|_| b'0' + r.below(10) as u8).collect();
+            }
+        }
+        const NOISE: &[u8] = b"0123456789-T:Z+ zt/.\x80\xff\x2f\x3a";
+        for _ in 0..r.below(3) {
+            if !s.is_empty() {
+                let i = r.below(s.len() as u64) as usize;
+                s[i] = NOISE[r.below(NOISE.len() as u64) as usize];
+            }
+        }
+        if r.below(20) == 0 && !s.is_empty() {
+            s.pop();
+        }
+        s
+    }
+
+    #[test]
+    fn fast_timestamps_match_the_exact_parser() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut accepted = 0;
+        for _ in 0..2_000_000 {
+            let s = candidate(&mut r);
+            let (fast, slow) = (parse_ts(&s), parse_ts_slow(&s));
+            assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&s));
+            accepted += fast.is_some() as u32;
+        }
+        assert!(accepted > 100_000, "the test should exercise valid timestamps too");
+    }
+
+    #[test]
+    fn known_timestamps() {
+        assert_eq!(parse_ts(b"2026-10-03T23:58:10Z"), Some(1_791_071_890_000));
+        assert_eq!(parse_ts(b"2026-10-03T19:58:10-04:00"), Some(1_791_071_890_000));
+        assert_eq!(parse_ts(b"0001791071890000"), Some(1_791_071_890_000));
+        assert_eq!(parse_ts(b"2028-02-29T00:00:00Z"), parse_ts_slow(b"2028-02-29T00:00:00Z"));
+        assert!(parse_ts(b"2026-02-29T00:00:00Z").is_none());
+        assert!(parse_ts(b"2026-10-03T23:58:10+0200").is_none());
+        assert!(parse_ts(b"2026-10-03 23:58:10Z").is_none());
+    }
 }
