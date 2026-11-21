@@ -324,41 +324,39 @@ fn bits_between(lo: usize, hi: usize) -> u64 {
 /// byte (then nothing between them can be a quote).
 fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F) {
     let n = d.len();
-    let mut fl = [Fd::default(); N];
-    let mut k = 0usize; // index of the current field
-    let mut fstart = 0usize; // start of the current field
-    let mut qcnt = 0u32; // quotes of the current field in blocks already passed
-    let mut bad = false;
+    // Per line: where its separators are (the first N; more means malformed),
+    // and how many quotes it holds. A line is well formed iff it has exactly N
+    // separators and its quotes number exactly 2 for each field that starts and
+    // ends with one (and is at least 2 long): then those are all its quotes, so
+    // every quote wraps a whole field. That is the per-field rule, checked once.
+    let mut seps = [0usize; N];
+    let mut k = 0usize; // separators so far in this line
+    let mut lstart = 0usize; // where this line starts
+    let mut qbase = 0u64; // quotes before the current block
+    let mut qstart = 0u64; // quotes before this line
     let mut skip = skip_first;
 
-    macro_rules! end_field {
-        ($pos:expr, $qc:expr) => {{
-            let (pos, qc): (usize, u32) = ($pos, $qc);
-            if k < N {
-                if qc == 0 {
-                    fl[k] = Fd { s: fstart, e: pos };
-                } else if qc == 2 && pos >= fstart + 2 && d[fstart] == b'"' && d[pos - 1] == b'"' {
-                    fl[k] = Fd { s: fstart + 1, e: pos - 1 };
-                } else {
-                    bad = true;
+    #[inline(always)]
+    fn line<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], lstart: usize, seps: &[usize; N], quotes: u64, f: &mut F) {
+        let mut fl = [Fd::default(); N];
+        let mut s = lstart;
+        for j in 0..N {
+            fl[j] = Fd { s, e: seps[j] };
+            s = seps[j] + 1;
+        }
+        if quotes != 0 {
+            let mut wrapped = 0u64;
+            for x in fl.iter_mut() {
+                if x.e >= x.s + 2 && d[x.s] == b'"' && d[x.e - 1] == b'"' {
+                    *x = Fd { s: x.s + 1, e: x.e - 1 };
+                    wrapped += 2;
                 }
-            } else {
-                bad = true; // too many fields
             }
-            k += 1;
-            qcnt = 0;
-            fstart = pos + 1;
-        }};
-    }
-    macro_rules! end_line {
-        () => {{
-            if !bad && k == N && !skip {
-                f(&fl);
+            if wrapped != quotes {
+                return; // a quote inside a field
             }
-            skip = false;
-            bad = false;
-            k = 0;
-        }};
+        }
+        f(&fl);
     }
 
     let mut base = 0usize;
@@ -375,21 +373,29 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
         while s != 0 {
             let bit = s.trailing_zeros() as usize;
             s &= s - 1;
-            let pos = base + bit;
-            // Quotes in [fstart, pos): earlier blocks' count plus this block's bits.
-            let qc = qcnt + (qt & bits_between(fstart.saturating_sub(base), bit)).count_ones();
-            end_field!(pos, qc);
+            seps[k.min(N - 1)] = base + bit;
+            k += 1;
             if (nl >> bit) & 1 != 0 {
-                end_line!();
+                let qend = qbase + (qt & bits_between(0, bit)).count_ones() as u64;
+                if k == N && !skip {
+                    line(d, lstart, &seps, qend - qstart, &mut f);
+                }
+                skip = false;
+                k = 0;
+                lstart = base + bit + 1;
+                qstart = qend;
             }
         }
-        // The open field's quotes in this block carry over to the next.
-        qcnt += (qt & bits_between(fstart.saturating_sub(base).min(64), 64)).count_ones();
+        qbase += qt.count_ones() as u64;
         base += 64;
     }
-    if k > 0 || fstart < n {
-        end_field!(n, qcnt); // a last line with no '\n'
-        end_line!();
+    if lstart < n {
+        // A last line with no '\n'.
+        seps[k.min(N - 1)] = n;
+        k += 1;
+        if k == N && !skip {
+            line(d, lstart, &seps, qbase - qstart, &mut f);
+        }
     }
 }
 
@@ -468,10 +474,12 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 /// Days from 1970-01-01 to the 1st of each month of 1970..2100, built at compile time.
 const TABLE_Y0: i64 = 1970;
 const TABLE_YEARS: usize = 130;
-const MONTH_START: [i32; TABLE_YEARS * 12] = {
-    let mut t = [0i32; TABLE_YEARS * 12];
+/// Days since 1970 at the start of each month from TABLE_Y0, plus one more
+/// entry (the month after the last), so a month's length is the next entry minus its own.
+const MONTH_START: [i32; TABLE_YEARS * 12 + 1] = {
+    let mut t = [0i32; TABLE_YEARS * 12 + 1];
     let mut i = 0;
-    while i < TABLE_YEARS * 12 {
+    while i <= TABLE_YEARS * 12 {
         let (y, m) = (TABLE_Y0 + (i / 12) as i64, (i % 12) as i64 + 1);
         let yy = if m <= 2 { y - 1 } else { y };
         let era = yy.div_euclid(400);
@@ -569,6 +577,114 @@ fn parse_iso_fast(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + h) * 60 + mi) * 60_000 + se * 1000 - off)
 }
 
+/// `parse_ts(&d[f.s..f.e])`, faster: SSE for F1 and F2, and for F3 of up to 16
+/// digits (loads may read bytes of `d` before the field, never outside `d`).
+#[inline(always)]
+fn ts_at(d: &[u8], f: Fd) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let n = f.e - f.s;
+        if n == 20 || n == 25 {
+            if let Some(v) = iso_sse(&d[f.s..f.e]) {
+                return Some(v);
+            }
+        } else if (1..=16).contains(&n) && f.e >= 16 {
+            // Shorter than F1, so only F3 can be valid.
+            return digits_sse(&d[f.e - 16..f.e], n).map(|v| v as i64);
+        }
+    }
+    parse_ts(&d[f.s..f.e])
+}
+
+/// F1 or F2 (`s` is 20 or 25 bytes) -> epoch ms, or None to let the exact
+/// parser decide (it also reads 20 or 25 digits as F3).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn iso_sse(s: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    // SAFETY: s has at least 20 bytes, so the 16-byte load stays inside it.
+    let (y, mo, d, h, mi) = unsafe {
+        let v = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        let dg = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let digit = _mm_cmpeq_epi8(_mm_min_epu8(dg, _mm_set1_epi8(9)), dg);
+        let sep = _mm_cmpeq_epi8(v, _mm_setr_epi8(0, 0, 0, 0, 45, 0, 0, 45, 0, 0, 84, 0, 0, 58, 0, 0)); // - - T :
+        let at_sep = _mm_setr_epi8(0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0);
+        if _mm_movemask_epi8(_mm_blendv_epi8(digit, sep, at_sep)) != 0xffff {
+            return None;
+        }
+        // Digit pairs YY YY MM DD hh mm, each as 10 * first + second.
+        let pairs = _mm_shuffle_epi8(dg, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+        let w = _mm_maddubs_epi16(pairs, _mm_set1_epi16(0x010a));
+        (
+            _mm_extract_epi16::<0>(w) as i64 * 100 + _mm_extract_epi16::<1>(w) as i64,
+            _mm_extract_epi16::<2>(w) as i64,
+            _mm_extract_epi16::<3>(w) as i64,
+            _mm_extract_epi16::<4>(w) as i64,
+            _mm_extract_epi16::<5>(w) as i64,
+        )
+    };
+    let (s1, s2) = (s[17].wrapping_sub(b'0'), s[18].wrapping_sub(b'0'));
+    if s[16] != b':' || s1 > 9 || s2 > 9 {
+        return None;
+    }
+    let se = (s1 * 10 + s2) as i64;
+    let off = if n == 20 {
+        if s[19] != b'Z' {
+            return None;
+        }
+        0
+    } else {
+        let (sign, a, b) = (s[19], s[20].wrapping_sub(b'0'), s[21].wrapping_sub(b'0'));
+        let (c, e) = (s[23].wrapping_sub(b'0'), s[24].wrapping_sub(b'0'));
+        if (sign != b'+' && sign != b'-') || s[22] != b':' || a > 9 || b > 9 || c > 9 || e > 9 {
+            return None;
+        }
+        let (oh, om) = ((a * 10 + b) as i64, (c * 10 + e) as i64);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let o = (oh * 60 + om) * 60_000;
+        if sign == b'-' { -o } else { o }
+    };
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || !(TABLE_Y0..TABLE_Y0 + TABLE_YEARS as i64).contains(&y) {
+        return None; // (a year outside the table: the exact parser decides)
+    }
+    let i = (y - TABLE_Y0) as usize * 12 + mo as usize - 1;
+    let (start, next) = (MONTH_START[i] as i64, MONTH_START[i + 1] as i64);
+    if d < 1 || d > next - start {
+        return None;
+    }
+    Some((((start + d - 1) * 24 + h) * 60 + mi) * 60_000 + se * 1000 - off)
+}
+
+/// The last `n` (1..=16) bytes of `w` (16 bytes) as a decimal number, or None
+/// if any of them is not a digit.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn digits_sse(w: &[u8], n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    debug_assert!(w.len() == 16 && (1..=16).contains(&n));
+    // SAFETY: w is 16 bytes.
+    unsafe {
+        let v = _mm_loadu_si128(w.as_ptr() as *const __m128i);
+        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let keep = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15 - n as i8));
+        let x = _mm_blendv_epi8(_mm_set1_epi8(b'0' as i8), v, keep); // leading bytes become '0'
+        let dg = _mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8));
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(dg, _mm_set1_epi8(9)), dg)) != 0xffff {
+            return None;
+        }
+        let p2 = _mm_maddubs_epi16(dg, _mm_set1_epi16(0x010a)); // 8 x 2 digits
+        let p4 = _mm_madd_epi16(p2, _mm_set1_epi32(0x0001_0064)); // 4 x 4 digits
+        let p4 = _mm_packus_epi32(p4, p4);
+        let p8 = _mm_madd_epi16(p4, _mm_set1_epi32(0x0001_2710)); // 2 x 8 digits
+        let hi = _mm_cvtsi128_si32(p8) as u32 as u64;
+        let lo = _mm_extract_epi32::<1>(p8) as u32 as u64;
+        Some(hi * 100_000_000 + lo)
+    }
+}
+
 /// F1 / F2 / F3 -> epoch ms. None for any other form. A huge F3 saturates.
 #[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
@@ -636,6 +752,19 @@ fn parse_ts_slow(s: &[u8]) -> Option<i64> {
     };
     let ms = ((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + se * 1000;
     Some(ms - off)
+}
+
+/// event_type: Some(false) for view or cart, Some(true) for purchase, None otherwise.
+#[inline(always)]
+fn purchase_kind(s: &[u8]) -> Option<bool> {
+    match s.len() {
+        4 => {
+            let w = u32::from_le_bytes(s.try_into().unwrap());
+            (w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart")).then_some(false)
+        }
+        8 => (u64::from_le_bytes(s.try_into().unwrap()) == u64::from_le_bytes(*b"purchase")).then_some(true),
+        _ => None,
+    }
 }
 
 #[inline(always)]
@@ -1830,6 +1959,49 @@ mod tests {
             accepted += fast.is_some() as u32;
         }
         assert!(accepted > 100_000, "the test should exercise valid timestamps too");
+    }
+
+    #[test]
+    fn ts_at_matches_the_exact_parser() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let valid = [
+            "2026-10-03T23:58:10Z",
+            "2028-02-29T00:00:00Z",
+            "2027-02-29T00:00:00Z",
+            "2026-10-03T19:58:10-04:00",
+            "2026-12-31T23:59:59+12:00",
+            "2099-12-31T23:59:59Z",
+            "2100-01-01T00:00:00Z",
+            "1791071890000",
+            "0001791071890000",
+            "86400000",
+            "1",
+            "0",
+        ];
+        let alphabet = b"0123456789-T:Z+ .zt";
+        for i in 0..3_000_000 {
+            let mut s = valid[i % valid.len()].as_bytes().to_vec();
+            for _ in 0..(next() % 3) {
+                let p = (next() as usize) % s.len();
+                s[p] = alphabet[(next() as usize) % alphabet.len()];
+            }
+            if next() % 7 == 0 {
+                s.truncate((next() as usize) % (s.len() + 1));
+            }
+            // Bytes before the field, so the backward 16-byte load is allowed.
+            let mut d = b"xxxxxxxxxxxxxxxxxxxxxxxx".to_vec();
+            let start = d.len();
+            d.extend_from_slice(&s);
+            d.extend_from_slice(b",yyyy");
+            let f = Fd { s: start, e: start + s.len() };
+            assert_eq!(ts_at(&d, f), parse_ts_slow(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
     }
 
     #[test]

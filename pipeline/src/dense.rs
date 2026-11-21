@@ -551,7 +551,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 if fl[0].empty() {
                     return;
                 }
-                let ing_ms = parse_ts(&d[fl[3].s..fl[3].e]);
+                let ing_ms = ts_at(d, fl[3]);
                 let ingest = match ing_ms {
                     None => u32::MAX,
                     Some(ms) => {
@@ -568,17 +568,17 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     if fl[1].empty() || fl[5].empty() {
                         break 'v;
                     }
-                    let Some(t) = parse_ts(&d[fl[2].s..fl[2].e]) else { break 'v };
+                    let Some(t) = ts_at(d, fl[2]) else { break 'v };
                     if t < ws || t >= we {
                         break 'v;
                     }
-                    let price = match &d[fl[4].s..fl[4].e] {
-                        b"view" | b"cart" => 0,
-                        b"purchase" => match parse_price(&d[fl[6].s..fl[6].e]) {
+                    let price = match purchase_kind(&d[fl[4].s..fl[4].e]) {
+                        Some(false) => 0,
+                        Some(true) => match parse_price(&d[fl[6].s..fl[6].e]) {
                             Some(p) => p,
                             None => break 'v,
                         },
-                        _ => break 'v,
+                        None => break 'v,
                     };
                     if ing_ms.unwrap_or(i64::MAX).saturating_sub(t) > DAY {
                         break 'v; // late
@@ -785,7 +785,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 let Some(camp) = <u64 as Key<'_>>::make(d, fl[2].s, fl[2].e).and_then(|k| cat.campaigns.get(&k).copied()) else {
                     return;
                 };
-                let Some(ts) = parse_ts(&d[fl[3].s..fl[3].e]) else { return };
+                let Some(ts) = ts_at(d, fl[3]) else { return };
                 if ts < cl_base || ts >= we {
                     return;
                 }
