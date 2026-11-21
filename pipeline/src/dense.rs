@@ -115,6 +115,43 @@ fn b36(d: &[u8], s: usize, e: usize) -> Option<u64> {
     (r <= MASK).then_some(r)
 }
 
+/// Two IDs at once: `d[a]` and `d[b]` as `pa` / `pb` followed by canonical base
+/// 36, each decoded in one 64-bit lane of an SSE register (the same rules as
+/// `b36`). Needs 8 bytes of `d` before each field's end.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn b36x2(d: &[u8], a: Fd, pa: u8, b: Fd, pb: u8) -> (Option<u64>, Option<u64>) {
+    use std::arch::x86_64::*;
+    let (na, nb) = (a.e.wrapping_sub(a.s).wrapping_sub(1), b.e.wrapping_sub(b.s).wrapping_sub(1));
+    if na.wrapping_sub(1) >= 8 || nb.wrapping_sub(1) >= 8 || a.e < 9 || b.e < 9 {
+        let one = |f: Fd, p: u8| (f.e > f.s && d[f.s] == p).then(|| b36(d, f.s + 1, f.e)).flatten();
+        return (one(a, pa), one(b, pb));
+    }
+    let wa = u64::from_le_bytes(d[a.e - 8..a.e].try_into().unwrap());
+    let wb = u64::from_le_bytes(d[b.e - 8..b.e].try_into().unwrap());
+    let (ka, kb) = (!0u64 << (8 * (8 - na)), !0u64 << (8 * (8 - nb)));
+    let wa = (wa & ka) | (0x30 * ONES & !ka);
+    let wb = (wb & kb) | (0x30 * ONES & !kb);
+    // SAFETY: plain SSE arithmetic on registers.
+    let (ok, r) = unsafe {
+        let w = _mm_set_epi64x(wb as i64, wa as i64);
+        let dg = _mm_sub_epi8(w, _mm_set1_epi8(0x30));
+        let lt = _mm_sub_epi8(w, _mm_set1_epi8(0x61));
+        let is_dg = _mm_cmpeq_epi8(_mm_min_epu8(dg, _mm_set1_epi8(9)), dg);
+        let is_lt = _mm_cmpeq_epi8(_mm_min_epu8(lt, _mm_set1_epi8(25)), lt);
+        let ok = _mm_movemask_epi8(_mm_or_si128(is_dg, is_lt)) as u32;
+        let val = _mm_blendv_epi8(dg, _mm_add_epi8(lt, _mm_set1_epi8(10)), is_lt);
+        let p = _mm_maddubs_epi16(val, _mm_set1_epi16(0x0124)); // 36 * first + second
+        let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_0510)); // 1296 * first + second
+        let r = _mm_add_epi64(_mm_mul_epu32(q, _mm_set1_epi64x(1_679_616)), _mm_srli_epi64(q, 32));
+        (ok, [_mm_cvtsi128_si64(r) as u64, _mm_extract_epi64::<1>(r) as u64])
+    };
+    let lead0 = |w: u64, n: usize| n > 1 && (w >> (8 * (8 - n))) as u8 == b'0';
+    let ra = (d[a.s] == pa && ok & 0xff == 0xff && !lead0(wa, na) && r[0] <= MASK).then_some(r[0]);
+    let rb = (d[b.s] == pb && ok >> 8 == 0xff && !lead0(wb, nb) && r[1] <= MASK).then_some(r[1]);
+    (ra, rb)
+}
+
 fn b36_slow(s: &[u8]) -> Option<u64> {
     if s.is_empty() || s.len() > 8 || (s.len() > 1 && s[0] == b'0') {
         return None;
@@ -304,50 +341,73 @@ const HOME_MULTI: u32 = u32::MAX - 1;
 const P_NONE: u64 = 0;
 const P_COMPLEX: u64 = u64::MAX;
 
-/// The 7 fields of the event line starting at `ls`, split in one go: four
-/// 32-byte loads give its newline, comma and quote masks as 128-bit integers;
-/// the first newline ends it; it is well formed iff 6 commas come before it and
-/// its quotes all wrap whole fields. Returns (fields, or None for a malformed
-/// line; where the next line starts), or None (use the slow path) for a line of
-/// 128 bytes or more, or one too near the end of `d`.
+/// The N fields of the line starting at `ls`, split in one go: 32-byte loads
+/// give its newline, comma and quote masks (one 64-byte window as u64 when the
+/// line fits in it, else a 128-byte one as u128); the first newline ends the
+/// line; it is well formed iff N - 1 commas come before it and its quotes all
+/// wrap whole fields. Returns (fields, or None for a malformed line; where the
+/// next line starts), or None (use the slow path) for a line of 128 bytes or
+/// more, or one too near the end of `d`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-fn event_line(d: &[u8], ls: usize) -> Option<(Option<[Fd; 7]>, usize)> {
+fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<[Fd; N]>, usize)> {
     use std::arch::x86_64::*;
     if ls + 128 > d.len() {
         return None;
     }
-    // SAFETY: ls + 128 <= d.len(), so the four loads stay inside d.
-    let (nl, cm, qt) = unsafe {
-        let p = d.as_ptr().add(ls) as *const __m256i;
-        let v = [_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)), _mm256_loadu_si256(p.add(2)), _mm256_loadu_si256(p.add(3))];
-        let mask = |c: u8| -> u128 {
-            let x = _mm256_set1_epi8(c as i8);
-            let m = |i: usize| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v[i], x)) as u32 as u128;
-            m(0) | m(1) << 32 | m(2) << 64 | m(3) << 96
-        };
-        (mask(b'\n'), mask(b','), mask(b'"'))
+    // SAFETY: ls + 128 <= d.len(), so every load below stays inside d.
+    let load = |i: usize| unsafe { _mm256_loadu_si256(d.as_ptr().add(ls + 32 * i) as *const __m256i) };
+    let mask = |v: __m256i, c: u8| unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64 };
+    let (v0, v1) = (load(0), load(1));
+    let nl = mask(v0, b'\n') | mask(v1, b'\n') << 32;
+    let mut fl = [Fd::default(); N];
+    if nl != 0 {
+        // The whole line is in the first 64 bytes.
+        let e = nl.trailing_zeros();
+        let next = ls + e as usize + 1;
+        let below = (1u64 << e) - 1;
+        let mut m = (mask(v0, b',') | mask(v1, b',') << 32) & below;
+        if m.count_ones() as usize != N - 1 {
+            return Some((None, next));
+        }
+        let mut s = ls;
+        for x in fl.iter_mut().take(N - 1) {
+            let p = ls + m.trailing_zeros() as usize;
+            m &= m - 1;
+            *x = Fd { s, e: p };
+            s = p + 1;
+        }
+        fl[N - 1] = Fd { s, e: ls + e as usize };
+        let quotes = ((mask(v0, b'"') | mask(v1, b'"') << 32) & below).count_ones() as u64;
+        if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
+            return Some((None, next));
+        }
+        return Some((Some(fl), next));
+    }
+    let (v2, v3) = (load(2), load(3));
+    let wide = |c: u8| -> u128 {
+        (mask(v0, c) | mask(v1, c) << 32) as u128 | ((mask(v2, c) | mask(v3, c) << 32) as u128) << 64
     };
+    let nl = wide(b'\n');
     if nl == 0 {
         return None;
     }
     let e = nl.trailing_zeros();
     let next = ls + e as usize + 1;
     let below = (1u128 << e) - 1;
-    let mut m = cm & below;
-    if m.count_ones() != 6 {
+    let mut m = wide(b',') & below;
+    if m.count_ones() as usize != N - 1 {
         return Some((None, next));
     }
-    let mut fl = [Fd::default(); 7];
     let mut s = ls;
-    for x in fl.iter_mut().take(6) {
+    for x in fl.iter_mut().take(N - 1) {
         let p = ls + m.trailing_zeros() as usize;
         m &= m - 1;
         *x = Fd { s, e: p };
         s = p + 1;
     }
-    fl[6] = Fd { s, e: ls + e as usize };
-    let quotes = (qt & below).count_ones() as u64;
+    fl[N - 1] = Fd { s, e: ls + e as usize };
+    let quotes = (wide(b'"') & below).count_ones() as u64;
     if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
         return Some((None, next));
     }
@@ -356,8 +416,28 @@ fn event_line(d: &[u8], ls: usize) -> Option<(Option<[Fd; 7]>, usize)> {
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-fn event_line(_d: &[u8], _ls: usize) -> Option<(Option<[Fd; 7]>, usize)> {
+fn split_line<const N: usize>(_d: &[u8], _ls: usize) -> Option<(Option<[Fd; N]>, usize)> {
     None
+}
+
+/// Every well-formed line of a chunk, as N fields, to `row` (one call site, so it is inlined).
+#[inline(always)]
+fn each_line<const N: usize>(d: &[u8], skip_first: bool, mut row: impl FnMut(&[Fd; N])) {
+    let mut ls = if skip_first { memchr(b'\n', d).map_or(d.len(), |i| i + 1) } else { 0 };
+    while ls < d.len() {
+        let (fl, next) = match split_line::<N>(d, ls) {
+            Some(x) => x,
+            None => {
+                let e = memchr(b'\n', &d[ls..]).map_or(d.len(), |i| ls + i);
+                let mut fl = [Fd::default(); N];
+                (slow_line(d, ls, e, &mut fl).then_some(fl), e + 1)
+            }
+        };
+        ls = next;
+        if let Some(fl) = fl {
+            row(&fl);
+        }
+    }
 }
 
 enum Uid {
@@ -633,7 +713,11 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     let ev_out: Vec<EvOut> = per_thread(
         ev_chunks.len(),
         threads,
-        |_| EvOut { shards: (0..nsh).map(|_| Vec::with_capacity(cap)).collect(), odd: Vec::new(), ousers: Vec::new() },
+        |_| EvOut {
+            shards: (0..nsh).map(|_| Vec::with_capacity(cap)).collect(),
+            odd: Vec::new(),
+            ousers: Vec::new(),
+        },
         |st, ci| {
             let c = ev_chunks[ci];
             let d = c.data;
@@ -644,6 +728,8 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 if fl[0].empty() {
                     return;
                 }
+                // Both IDs decoded together.
+                let (ye, yu) = b36x2(d, fl[0], b'e', fl[1], b'u');
                 let ing_ms = ts_at(d, fl[3]);
                 let ingest = match ing_ms {
                     None => u32::MAX,
@@ -676,7 +762,12 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     if ing_ms.unwrap_or(i64::MAX).saturating_sub(t) > DAY {
                         break 'v; // late
                     }
-                    user = match uid(d, fl[1], ukey, pmax) {
+                    let norm = yu.map(|y| unscramble(y, ukey)).filter(|&v| v < KIOSK && (v >> 9) < pmax);
+                    let u = match norm {
+                        Some(v) => Some(Uid::Norm(v as u32)),
+                        None => <u64 as Key<'_>>::make(d, fl[1].s, fl[1].e).map(Uid::Other),
+                    };
+                    user = match u {
                         Some(Uid::Norm(v)) => v,
                         Some(Uid::Other(k)) => {
                             if st.ousers.len() >= (1 << O_SHIFT) - 1 {
@@ -695,7 +786,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     // Categories only matter for purchases (top_category sums purchase prices).
                     info = if price > 0 { price | cat.category_of(d, fl[5]) << 24 } else { 0 };
                 }
-                let num = (d[fl[0].s] == b'e').then(|| b36(d, fl[0].s + 1, fl[0].e)).flatten().map(|y| unscramble(y, ekey));
+                let num = ye.map(|y| unscramble(y, ekey));
                 match num {
                     Some(i) if i < imax => st.shards[(i >> SH) as usize].push(ERec { i: i as u32, ingest, ts, user, info }),
                     _ => match <u64 as Key<'_>>::make(d, fl[0].s, fl[0].e) {
@@ -704,23 +795,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     },
                 }
             };
-            // Line by line: an ordinary line is split in one go (event_line);
-            // anything else, byte by byte.
-            let mut ls = if c.skip_first { memchr(b'\n', d).map_or(d.len(), |i| i + 1) } else { 0 };
-            while ls < d.len() {
-                let (fl, next) = match event_line(d, ls) {
-                    Some(x) => x,
-                    None => {
-                        let e = memchr(b'\n', &d[ls..]).map_or(d.len(), |i| ls + i);
-                        let mut fl = [Fd::default(); 7];
-                        (slow_line(d, ls, e, &mut fl).then_some(fl), e + 1)
-                    }
-                };
-                ls = next;
-                if let Some(fl) = fl {
-                    row(&fl);
-                }
-            }
+            each_line::<7>(d, c.skip_first, &mut row);
         },
     );
     if bad.load(Relaxed) {
@@ -906,7 +981,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 let name = pk_name(pk);
                 st.cx[shard_of(&name)].push(CRec { name, id: c.id, ts: cl_base + c.ts as i64, camp: c.camp });
             };
-            scan::<4, _>(d, c.skip_first, |fl| {
+            each_line::<4>(d, c.skip_first, |fl| {
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
                 }
@@ -1265,6 +1340,35 @@ mod tests {
         assert_eq!(b36(b"xxxxxxxxzzzzzzzz", 8, 16), None); // 36^8 - 1 > 2^40
         assert_eq!(b36(b"xxxxxxxx0", 8, 9), Some(0));
         assert_eq!(b36(b"xxxxxxxx01", 8, 10), None);
+    }
+
+    #[test]
+    fn base36_pair_matches_single() {
+        let mut s = 11u64;
+        let mut alphabet = b"0123456789abcdefghijklmnopqrstuvwxyzueAZ_".to_vec();
+        alphabet.extend([0x7f, 0x80]);
+        for _ in 0..300_000 {
+            let mut d = b"xxxxxxxxxxxx".to_vec();
+            let mut fields = Vec::new();
+            for _ in 0..2 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let n = (s >> 59) as usize % 11;
+                let start = d.len();
+                for j in 0..n {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let c = if j == 0 && s >> 62 != 0 { if s >> 61 & 1 == 0 { b'e' } else { b'u' } } else if s >> 63 == 0 {
+                        alphabet[(s >> 40) as usize % 36]
+                    } else {
+                        alphabet[(s >> 40) as usize % alphabet.len()]
+                    };
+                    d.push(c);
+                }
+                fields.push(Fd { s: start, e: d.len() });
+                d.push(b',');
+            }
+            let one = |f: Fd, p: u8| (f.e > f.s && d[f.s] == p).then(|| b36(&d, f.s + 1, f.e)).flatten();
+            assert_eq!(b36x2(&d, fields[0], b'e', fields[1], b'u'), (one(fields[0], b'e'), one(fields[1], b'u')), "{:?}", String::from_utf8_lossy(&d));
+        }
     }
 
     #[test]
