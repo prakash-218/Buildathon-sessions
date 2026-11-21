@@ -3,16 +3,21 @@
 //! Plan:
 //!   1. mmap every input file and cut all of them into line-aligned chunks.
 //!   2. Links: union-find over the IDs; each person is named by its smallest ID.
-//!   3. Events: parse + validate every copy in parallel, scattered by hash(event_id);
+//!   3. Events: parse + validate every copy in parallel, sharded by event_id;
 //!      dedup each shard (smallest ingest_ts wins, then the kept copy's validity
-//!      decides), then scatter survivors by hash(person).
-//!   4. Clicks: parse + validate, scattered by hash(person). No dedup is needed:
+//!      decides), then reshard survivors by person.
+//!   4. Clicks: parse + validate, sharded by person. No dedup is needed:
 //!      copies are identical, so they cannot change a credit or an assist.
 //!   5. Per person shard: sessionize, credit, assists, aggregate.
 //!   6. Write Parquet.
+//!
+//! IDs are packed into u128 (bytes big-endian, length in the low byte), which
+//! keeps byte-wise order and makes hashing and comparing integer operations.
+//! An ID longer than 15 bytes cannot be packed: then the whole run is redone
+//! with byte-slice keys, which are slower but have no limit.
 
-use memchr::{memchr, memchr_iter};
-use memmap2::Mmap;
+use memchr::memchr;
+use memmap2::{Advice, Mmap};
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
@@ -21,29 +26,123 @@ use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map::Entry;
 use std::fs::File;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const NB: usize = 256; // shards for both shuffles
+const INVALID: u32 = u32::MAX; // ERec::cat of an event copy that fails validation
 
-// ------------------------------------------------------------------ hashing
+// --------------------------------------------------------------------- keys
 
-#[inline]
-fn hash_bytes(b: &[u8]) -> u64 {
-    FxBuildHasher.hash_one(b)
+trait Key<'a>: Copy + Eq + Ord + Hash + Send + Sync + Default {
+    /// The ID `d[s..e]`, or None if this key type cannot hold it.
+    fn make(d: &'a [u8], s: usize, e: usize) -> Option<Self>;
+    fn put(self, out: &mut Vec<u8>);
 }
 
-/// Shard from the middle bits, so it does not correlate with the bits the
-/// hash maps inside each shard use (low bits for position, top 7 for tags).
-#[inline]
-fn shard_of(b: &[u8]) -> usize {
-    ((hash_bytes(b) >> 32) as usize) & (NB - 1)
+impl<'a> Key<'a> for u128 {
+    #[inline(always)]
+    fn make(d: &'a [u8], s: usize, e: usize) -> Option<u128> {
+        let n = e - s;
+        if n > 15 {
+            return None;
+        }
+        let mut b = [0u8; 16];
+        if s + 16 <= d.len() {
+            b.copy_from_slice(&d[s..s + 16]); // one 16-byte load, masked below
+        } else {
+            b[..n].copy_from_slice(&d[s..e]);
+        }
+        let v = u128::from_be_bytes(b);
+        let mask = if n == 0 { 0 } else { !0u128 << (128 - 8 * n) };
+        Some((v & mask) | n as u128)
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        let b = self.to_be_bytes();
+        out.extend_from_slice(&b[..b[15] as usize]);
+    }
+}
+
+/// Up to 9 ASCII bytes (1..=127), 7 bits each, big-endian, zero-padded: 63 bits.
+/// No byte is 0, so padding sorts before every byte and order stays byte-wise.
+/// The generator's IDs are a letter and at most 8 base-36 digits, so they all fit.
+impl<'a> Key<'a> for u64 {
+    #[inline(always)]
+    fn make(d: &'a [u8], s: usize, e: usize) -> Option<u64> {
+        let n = e - s;
+        if n > 9 {
+            return None;
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if s + 8 <= d.len() {
+            const HI: u64 = 0x8080_8080_8080_8080;
+            const LO: u64 = 0x0101_0101_0101_0101;
+            let m = n.min(8);
+            let keep = if m == 0 { 0 } else { !0u64 << (64 - 8 * m) }; // the first m bytes
+            let w = u64::from_be_bytes(d[s..s + 8].try_into().unwrap()) & keep;
+            let w2 = w | (LO & !keep); // padding bytes become 1 so only real bytes can be zero
+            if w & HI != 0 || (w2.wrapping_sub(LO) & !w2 & HI) != 0 {
+                return None; // non-ASCII or NUL
+            }
+            let packed = unsafe { std::arch::x86_64::_pext_u64(w, 0x7f7f_7f7f_7f7f_7f7f) };
+            let last = if n == 9 { d[s + 8] } else { 0 };
+            if n == 9 && (last == 0 || last > 127) {
+                return None;
+            }
+            return Some(packed << 7 | last as u64);
+        }
+        let mut v = 0u64;
+        for i in 0..9 {
+            let c = if i < n { d[s + i] } else { 0 };
+            if i < n && (c == 0 || c > 127) {
+                return None;
+            }
+            v = v << 7 | c as u64;
+        }
+        Some(v)
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        for i in 0..9 {
+            let c = (self >> (7 * (8 - i))) as u8 & 0x7f;
+            if c == 0 {
+                break;
+            }
+            out.push(c);
+        }
+    }
+}
+
+impl<'a> Key<'a> for &'a [u8] {
+    #[inline(always)]
+    fn make(d: &'a [u8], s: usize, e: usize) -> Option<Self> {
+        Some(&d[s..e])
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self);
+    }
+}
+
+#[inline(always)]
+fn fmix64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+/// Shard from a re-mixed hash, so the shard does not correlate with the hash
+/// bits the maps inside each shard use.
+#[inline(always)]
+fn shard_of<T: Hash>(k: &T) -> usize {
+    (fmix64(FxBuildHasher.hash_one(k)) >> 56) as usize & (NB - 1)
 }
 
 fn new_map<K, V>(cap: usize) -> FxHashMap<K, V> {
@@ -52,56 +151,138 @@ fn new_map<K, V>(cap: usize) -> FxHashMap<K, V> {
 
 // ---------------------------------------------------------------------- CSV
 
-/// Split one line (no '\n') into exactly N fields under the dialect:
-/// quotes only around a whole field, never inside; empty field = null (empty slice).
-#[inline]
-fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
-    if line.is_empty() {
-        return false; // an empty line is malformed
-    }
-    let mut start = 0usize;
-    let mut k = 0usize;
-    for pos in memchr_iter(b',', line) {
-        if k + 1 >= N {
-            return false; // too many fields
-        }
-        out[k] = &line[start..pos];
-        k += 1;
-        start = pos + 1;
-    }
-    if k + 1 != N {
-        return false; // too few fields
-    }
-    out[k] = &line[start..];
-    for f in out.iter_mut() {
-        let s = *f;
-        if let Some(q) = memchr(b'"', s) {
-            let n = s.len();
-            if q != 0 || n < 2 || s[n - 1] != b'"' || memchr(b'"', &s[1..n - 1]).is_some() {
-                return false;
-            }
-            *f = &s[1..n - 1];
-        }
-    }
-    true
+/// A field's value as `d[s..e]`, quotes already removed. Empty means null.
+#[derive(Clone, Copy, Default)]
+struct Fd {
+    s: usize,
+    e: usize,
 }
 
-/// Call `f` on every line of `data`. Only '\n' ends a line. Empty segments are
-/// passed through too (split() rejects them as malformed).
-#[inline]
-fn for_each_line<'a, F: FnMut(&'a [u8])>(data: &'a [u8], skip_first: bool, mut f: F) {
-    let mut start = 0usize;
-    let mut skip = skip_first;
-    for nl in memchr_iter(b'\n', data) {
-        if skip {
-            skip = false;
-        } else {
-            f(&data[start..nl]);
-        }
-        start = nl + 1;
+impl Fd {
+    #[inline(always)]
+    fn empty(self) -> bool {
+        self.s == self.e
     }
-    if start < data.len() && !skip {
-        f(&data[start..]);
+}
+
+/// Newline, comma and quote masks for the 64 bytes at `d[base..]` (zero-padded at the end).
+#[inline(always)]
+fn masks(d: &[u8], base: usize) -> (u64, u64, u64) {
+    if base + 64 <= d.len() {
+        block_masks(&d[base..base + 64])
+    } else {
+        let mut b = [0u8; 64];
+        let n = d.len() - base;
+        b[..n].copy_from_slice(&d[base..]);
+        block_masks(&b)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn block_masks(b: &[u8]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    debug_assert!(b.len() >= 64);
+    unsafe {
+        let p = b.as_ptr() as *const __m256i;
+        let lo = _mm256_loadu_si256(p);
+        let hi = _mm256_loadu_si256(p.add(1));
+        let eq = |c: u8| -> u64 {
+            let v = _mm256_set1_epi8(c as i8);
+            let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v)) as u32 as u64;
+            let h = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v)) as u32 as u64;
+            a | (h << 32)
+        };
+        (eq(b'\n'), eq(b','), eq(b'"'))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn block_masks(b: &[u8]) -> (u64, u64, u64) {
+    let (mut nl, mut cm, mut qt) = (0u64, 0u64, 0u64);
+    for (i, &c) in b[..64].iter().enumerate() {
+        nl |= ((c == b'\n') as u64) << i;
+        cm |= ((c == b',') as u64) << i;
+        qt |= ((c == b'"') as u64) << i;
+    }
+    (nl, cm, qt)
+}
+
+/// Call `f` with the N fields of every well-formed line of `d`, under the CSV
+/// dialect: only '\n' ends a line, exactly N fields, quotes only around a whole
+/// field (and nowhere inside it). Malformed and empty lines are skipped, and so
+/// is the first line when `skip_first` (the file's header).
+#[inline(always)]
+#[allow(unused_assignments)] // the macros' resets after the last line
+fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F) {
+    let n = d.len();
+    let mut fl = [Fd::default(); N];
+    let mut k = 0usize; // index of the current field
+    let mut fstart = 0usize; // start of the current field
+    let (mut qcnt, mut qfirst, mut qlast) = (0u32, 0usize, 0usize); // quotes in the current field
+    let mut bad = false;
+    let mut skip = skip_first;
+
+    macro_rules! end_field {
+        ($pos:expr) => {{
+            let pos: usize = $pos;
+            if !bad {
+                if k < N {
+                    if qcnt == 0 {
+                        fl[k] = Fd { s: fstart, e: pos };
+                    } else if qcnt == 2 && qfirst == fstart && qlast + 1 == pos {
+                        fl[k] = Fd { s: fstart + 1, e: pos - 1 };
+                    } else {
+                        bad = true;
+                    }
+                } else {
+                    bad = true; // too many fields
+                }
+            }
+            k += 1;
+            qcnt = 0;
+            fstart = pos + 1;
+        }};
+    }
+    macro_rules! end_line {
+        () => {{
+            if !bad && k == N && !skip {
+                f(&fl);
+            }
+            skip = false;
+            bad = false;
+            k = 0;
+        }};
+    }
+
+    let mut base = 0usize;
+    while base < n {
+        let (nl, cm, qt) = masks(d, base);
+        let mut s = nl | cm | qt;
+        while s != 0 {
+            let bit = s.trailing_zeros();
+            s &= s - 1;
+            let m = 1u64 << bit;
+            let pos = base + bit as usize;
+            if qt & m != 0 {
+                if qcnt == 0 {
+                    qfirst = pos;
+                }
+                qlast = pos;
+                qcnt += 1;
+            } else {
+                end_field!(pos);
+                if nl & m != 0 {
+                    end_line!();
+                }
+            }
+        }
+        base += 64;
+    }
+    if k > 0 || fstart < n {
+        end_field!(n); // a last line with no '\n'
+        end_line!();
     }
 }
 
@@ -133,20 +314,20 @@ fn make_chunks<'a>(bufs: &[&'a [u8]], target: usize) -> Vec<Chunk<'a>> {
 
 // --------------------------------------------------------------- Timestamps
 
-#[inline]
+#[inline(always)]
 fn d2(s: &[u8], i: usize) -> Option<i64> {
     let a = s[i].wrapping_sub(b'0');
     let b = s[i + 1].wrapping_sub(b'0');
     if a < 10 && b < 10 { Some((a * 10 + b) as i64) } else { None }
 }
 
-#[inline]
+#[inline(always)]
 fn all_digits(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|c| c.is_ascii_digit())
 }
 
 /// Digits -> value, saturating at i64::MAX (too long is "outside the window", not malformed).
-#[inline]
+#[inline(always)]
 fn digits_sat(s: &[u8]) -> i64 {
     let mut v: i64 = 0;
     for &c in s {
@@ -155,6 +336,7 @@ fn digits_sat(s: &[u8]) -> i64 {
     v
 }
 
+#[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -165,7 +347,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-#[inline]
+#[inline(always)]
 fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -177,18 +359,17 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 }
 
 /// F1 / F2 / F3 -> epoch ms. None for any other form. A huge F3 saturates.
-#[inline]
+#[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 0 {
         return None;
     }
-    if n != 20 && n != 25 {
+    if (n != 20 && n != 25) || s[4] != b'-' {
         return if all_digits(s) { Some(digits_sat(s)) } else { None };
     }
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-        // 20 or 25 characters can still be an F3 value.
-        return if all_digits(s) { Some(digits_sat(s)) } else { None };
+    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        return None;
     }
     let y = d2(s, 0)? * 100 + d2(s, 2)?;
     let mo = d2(s, 5)?;
@@ -221,7 +402,7 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(ms - off)
 }
 
-#[inline]
+#[inline(always)]
 fn parse_price(s: &[u8]) -> Option<u32> {
     if !all_digits(s) {
         return None;
@@ -232,22 +413,21 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 // ------------------------------------------------------------------ records
 
-/// One parsed event copy, before dedup.
+/// One parsed event copy, before dedup. `cat == INVALID` marks a copy that fails validation.
 #[derive(Clone, Copy)]
-struct ERec<'a> {
-    id: &'a [u8],
-    name: &'a [u8], // the person; only set when valid
+struct ERec<K> {
+    id: K,
+    name: K, // the person
     ingest: i64,
     ts: i64,
     price: u32, // purchase price, 0 for view/cart
     cat: u32,   // category rank
-    valid: bool,
 }
 
 /// A surviving event, keyed by person.
 #[derive(Clone, Copy)]
-struct PRec<'a> {
-    name: &'a [u8],
+struct PRec<K> {
+    name: K,
     ts: i64,
     price: u32,
     cat: u32,
@@ -255,9 +435,9 @@ struct PRec<'a> {
 
 /// A valid click, keyed by person.
 #[derive(Clone, Copy)]
-struct CRec<'a> {
-    name: &'a [u8],
-    id: &'a [u8],
+struct CRec<K> {
+    name: K,
+    id: K,
     ts: i64,
     camp: u32,
 }
@@ -269,15 +449,15 @@ struct Ev {
     cat: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Cl<'a> {
+#[derive(Clone, Copy, Default)]
+struct Cl<K> {
     ts: i64,
-    id: &'a [u8],
+    id: K,
     camp: u32,
 }
 
-struct URow<'a> {
-    name: &'a [u8],
+struct URow<K> {
+    name: K,
     day: i32,
     sessions: i64,
     events: i64,
@@ -318,20 +498,21 @@ fn map_dir(dir: &Path) -> Vec<Mmap> {
             if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                 return None;
             }
-            Some(unsafe { Mmap::map(&f) }.expect("mmap input"))
+            let m = unsafe { Mmap::map(&f) }.expect("mmap input");
+            let _ = m.advise(Advice::WillNeed); // start reading it in the background
+            Some(m)
         })
         .collect()
 }
 
-fn small_csv<'a, const N: usize>(buf: &'a [u8]) -> Vec<[&'a [u8]; N]> {
-    let mut rows = Vec::new();
-    for_each_line(buf, true, |line| {
-        let mut f: [&[u8]; N] = [&[]; N];
-        if split(line, &mut f) {
-            rows.push(f);
-        }
-    });
-    rows
+struct Inputs<'a> {
+    ws: i64,
+    we: i64,
+    products: &'a [u8],
+    campaigns: &'a [u8],
+    events: Vec<&'a [u8]>,
+    clicks: Vec<&'a [u8]>,
+    links: Vec<&'a [u8]>,
 }
 
 // --------------------------------------------------------------------- main
@@ -357,78 +538,103 @@ fn main() {
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
     let we = parse_ts(json_str(&manifest, "window_end").as_bytes()).expect("window_end");
 
-    let products_buf = std::fs::read(data.join("products.csv")).expect("products.csv");
-    let campaigns_buf = std::fs::read(data.join("campaigns.csv")).expect("campaigns.csv");
     let ev_maps = map_dir(&data.join("events"));
     let cl_maps = map_dir(&data.join("clicks"));
     let ln_maps = map_dir(&data.join("links"));
+    let products_buf = std::fs::read(data.join("products.csv")).expect("products.csv");
+    let campaigns_buf = std::fs::read(data.join("campaigns.csv")).expect("campaigns.csv");
     log(t0, &format!("mapped inputs, {threads} threads"));
 
-    let ev_bufs: Vec<&[u8]> = ev_maps.iter().map(|m| &m[..]).collect();
-    let cl_bufs: Vec<&[u8]> = cl_maps.iter().map(|m| &m[..]).collect();
-    let ln_bufs: Vec<&[u8]> = ln_maps.iter().map(|m| &m[..]).collect();
-
-    run(t0, &out, ws, we, &products_buf, &campaigns_buf, &ev_bufs, &cl_bufs, &ln_bufs, threads);
+    let inp = Inputs {
+        ws,
+        we,
+        products: &products_buf,
+        campaigns: &campaigns_buf,
+        events: ev_maps.iter().map(|m| &m[..]).collect(),
+        clicks: cl_maps.iter().map(|m| &m[..]).collect(),
+        links: ln_maps.iter().map(|m| &m[..]).collect(),
+    };
+    // KEYS=128 or KEYS=slice skips the smaller key types (to test the fallbacks).
+    let keys = std::env::var("KEYS").unwrap_or_default();
+    let done = (keys.is_empty() && run::<u64>(t0, &out, &inp, threads))
+        || (keys != "slice" && {
+            log(t0, "using 128-bit keys");
+            run::<u128>(t0, &out, &inp, threads)
+        });
+    if !done {
+        log(t0, "using byte-slice keys");
+        assert!(run::<&[u8]>(t0, &out, &inp, threads));
+    }
     log(t0, "done");
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run<'a>(
-    t0: Instant,
-    out: &Path,
-    ws: i64,
-    we: i64,
-    products_buf: &'a [u8],
-    campaigns_buf: &'a [u8],
-    ev_bufs: &[&'a [u8]],
-    cl_bufs: &[&'a [u8]],
-    ln_bufs: &[&'a [u8]],
-    threads: usize,
-) {
+/// The whole pipeline with key type K. Returns false, having written nothing,
+/// if some ID does not fit K.
+fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize) -> bool {
+    let (ws, we) = (inp.ws, inp.we);
+    let fail = AtomicBool::new(false);
+
     // ---- Products -> category rank. Ranks follow byte order of the names,
     // so "smallest name wins a tie" becomes "smallest rank wins".
-    let prod_rows = small_csv::<2>(products_buf);
-    let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r[1]).collect();
+    let mut prod_rows: Vec<(K, &[u8])> = Vec::new();
+    let pb = inp.products;
+    scan::<2, _>(pb, true, |fl| match K::make(pb, fl[0].s, fl[0].e) {
+        Some(k) => prod_rows.push((k, &pb[fl[1].s..fl[1].e])),
+        None => fail.store(true, Relaxed),
+    });
+    let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
     cat_names.push(b"unknown");
     cat_names.sort_unstable();
     cat_names.dedup();
-    let cat_rank: FxHashMap<&[u8], u32> =
-        cat_names.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+    let cat_rank: FxHashMap<&[u8], u32> = cat_names.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
     let unknown = cat_rank[&b"unknown"[..]];
-    let products: FxHashMap<&[u8], u32> =
-        prod_rows.iter().map(|r| (r[0], cat_rank[r[1]])).collect();
+    let products: FxHashMap<K, u32> = prod_rows.iter().map(|r| (r.0, cat_rank[r.1])).collect();
     let ncat = cat_names.len();
 
     // ---- Campaigns.
-    let camp_rows = small_csv::<2>(campaigns_buf);
-    let campaigns: FxHashMap<&[u8], u32> =
-        camp_rows.iter().enumerate().map(|(i, r)| (r[0], i as u32)).collect();
+    let mut camp_rows: Vec<(K, &[u8], &[u8])> = Vec::new();
+    let cb = inp.campaigns;
+    scan::<2, _>(cb, true, |fl| match K::make(cb, fl[0].s, fl[0].e) {
+        Some(k) => camp_rows.push((k, &cb[fl[0].s..fl[0].e], &cb[fl[1].s..fl[1].e])),
+        None => fail.store(true, Relaxed),
+    });
+    let campaigns: FxHashMap<K, u32> = camp_rows.iter().enumerate().map(|(i, r)| (r.0, i as u32)).collect();
     let ncamp = camp_rows.len();
     let organic = ncamp; // index of "organic"
+    if fail.load(Relaxed) {
+        return false;
+    }
 
-    let total: usize = ev_bufs.iter().chain(cl_bufs).map(|b| b.len()).sum();
+    let total: usize = inp.events.iter().chain(&inp.clicks).map(|b| b.len()).sum();
     let target = (total / (threads * 16)).clamp(256 << 10, 64 << 20);
 
     // ---- Links: union-find, person named by the byte-wise smallest ID.
-    let ln_chunks = make_chunks(ln_bufs, target);
-    let pairs: Vec<Vec<(&[u8], &[u8])>> = ln_chunks
+    let ln_chunks = make_chunks(&inp.links, target);
+    let pairs: Vec<Vec<(K, K)>> = ln_chunks
         .par_iter()
         .map(|c| {
-            let mut v = Vec::new();
-            for_each_line(c.data, c.skip_first, |line| {
-                let mut f: [&[u8]; 2] = [&[]; 2];
-                if split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((f[0], f[1]));
+            let d = c.data;
+            let mut v = Vec::with_capacity(d.len() / 20);
+            scan::<2, _>(d, c.skip_first, |fl| {
+                if fl[0].empty() || fl[1].empty() {
+                    return;
+                }
+                match (K::make(d, fl[0].s, fl[0].e), K::make(d, fl[1].s, fl[1].e)) {
+                    (Some(a), Some(b)) => v.push((a, b)),
+                    _ => fail.store(true, Relaxed),
                 }
             });
             v
         })
         .collect();
-    let link_map: FxHashMap<&[u8], &[u8]> = {
+    if fail.load(Relaxed) {
+        return false;
+    }
+    let link_map: FxHashMap<K, K> = {
         let n: usize = pairs.iter().map(|v| v.len()).sum();
-        let mut ids: FxHashMap<&[u8], u32> = new_map(n);
+        let mut ids: FxHashMap<K, u32> = new_map(n);
         let mut parent: Vec<u32> = Vec::with_capacity(n);
-        let mut keys: Vec<&[u8]> = Vec::with_capacity(n);
+        let mut keys: Vec<K> = Vec::with_capacity(n);
         fn find(parent: &mut [u32], mut x: u32) -> u32 {
             while parent[x as usize] != x {
                 let g = parent[parent[x as usize] as usize];
@@ -439,7 +645,7 @@ fn run<'a>(
         }
         for v in &pairs {
             for &(a, b) in v {
-                let mut intern = |s: &'a [u8]| -> u32 {
+                let mut intern = |s: K| -> u32 {
                     *ids.entry(s).or_insert_with(|| {
                         let i = parent.len() as u32;
                         parent.push(i);
@@ -456,19 +662,17 @@ fn run<'a>(
                 }
             }
         }
-        let mut name: Vec<&[u8]> = vec![&[]; keys.len()];
-        let mut has: Vec<bool> = vec![false; keys.len()];
         let roots: Vec<u32> = (0..keys.len() as u32).map(|i| find(&mut parent, i)).collect();
+        let mut name: Vec<Option<K>> = vec![None; keys.len()];
         for (i, &r) in roots.iter().enumerate() {
-            let r = r as usize;
-            if !has[r] || keys[i] < name[r] {
-                name[r] = keys[i];
-                has[r] = true;
+            let slot = &mut name[r as usize];
+            if slot.is_none_or(|nm| keys[i] < nm) {
+                *slot = Some(keys[i]);
             }
         }
         let mut m = new_map(keys.len());
         for (i, &r) in roots.iter().enumerate() {
-            let nm = name[r as usize];
+            let nm = name[r as usize].unwrap();
             if nm != keys[i] {
                 m.insert(keys[i], nm);
             }
@@ -477,38 +681,37 @@ fn run<'a>(
     };
     drop(pairs);
     log(t0, &format!("links: {} renamed ids", link_map.len()));
-    let person_of = |uid: &'a [u8]| -> &'a [u8] { link_map.get(uid).copied().unwrap_or(uid) };
+    let person_of = |uid: K| -> K { link_map.get(&uid).copied().unwrap_or(uid) };
 
-    // ---- Events: parse every copy, scatter by hash(event_id).
-    let ev_chunks = make_chunks(ev_bufs, target);
-    let parsed: Vec<Vec<Vec<ERec>>> = ev_chunks
+    // ---- Events: parse every copy, shard by event_id.
+    let ev_chunks = make_chunks(&inp.events, target);
+    let parsed: Vec<Vec<Vec<ERec<K>>>> = ev_chunks
         .par_iter()
         .map(|c| {
-            let cap = c.data.len() / 70 / NB + 4;
-            let mut out: Vec<Vec<ERec>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
-            for_each_line(c.data, c.skip_first, |line| {
-                let mut f: [&[u8]; 7] = [&[]; 7];
-                if !split(line, &mut f) {
+            let d = c.data;
+            let cap = d.len() / 70 / NB + 4;
+            let mut out: Vec<Vec<ERec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            scan::<7, _>(d, c.skip_first, |fl| {
+                if fl[0].empty() {
                     return;
                 }
-                let id = f[0];
-                if id.is_empty() {
+                let Some(id) = K::make(d, fl[0].s, fl[0].e) else {
+                    fail.store(true, Relaxed);
                     return;
-                }
-                let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                let mut rec = ERec { id, name: &[], ingest, ts: 0, price: 0, cat: 0, valid: false };
+                };
+                let ingest = parse_ts(&d[fl[3].s..fl[3].e]).unwrap_or(i64::MAX);
+                let mut rec = ERec { id, name: K::default(), ingest, ts: 0, price: 0, cat: INVALID };
                 'v: {
-                    let uid = f[1];
-                    if uid.is_empty() || f[5].is_empty() {
+                    if fl[1].empty() || fl[5].empty() {
                         break 'v;
                     }
-                    let Some(ts) = parse_ts(f[2]) else { break 'v };
+                    let Some(ts) = parse_ts(&d[fl[2].s..fl[2].e]) else { break 'v };
                     if ts < ws || ts >= we {
                         break 'v;
                     }
-                    let price = match f[4] {
+                    let price = match &d[fl[4].s..fl[4].e] {
                         b"view" | b"cart" => 0,
-                        b"purchase" => match parse_price(f[6]) {
+                        b"purchase" => match parse_price(&d[fl[6].s..fl[6].e]) {
                             Some(p) => p,
                             None => break 'v,
                         },
@@ -517,25 +720,68 @@ fn run<'a>(
                     if ingest.saturating_sub(ts) > DAY {
                         break 'v; // late
                     }
-                    rec.valid = true;
+                    let Some(uid) = K::make(d, fl[1].s, fl[1].e) else {
+                        fail.store(true, Relaxed);
+                        break 'v;
+                    };
+                    rec.name = person_of(uid);
+                    // A product ID that does not fit K is not in products.csv (all of those fit).
+                    rec.cat = K::make(d, fl[5].s, fl[5].e)
+                        .and_then(|p| products.get(&p).copied())
+                        .unwrap_or(unknown);
                     rec.ts = ts;
                     rec.price = price;
-                    rec.cat = products.get(f[5]).copied().unwrap_or(unknown);
-                    rec.name = person_of(uid);
                 }
-                out[shard_of(id)].push(rec);
+                out[shard_of(&id)].push(rec);
             });
             out
         })
         .collect();
+    if fail.load(Relaxed) {
+        return false;
+    }
     log(t0, &format!("events parsed ({} chunks)", ev_chunks.len()));
 
-    // ---- Dedup each event_id shard; scatter survivors by hash(person).
-    let dedup: Vec<Vec<Vec<PRec>>> = (0..NB)
+    // ---- Clicks: parse + validate, shard by person.
+    let cl_chunks = make_chunks(&inp.clicks, target);
+    let clicks: Vec<Vec<Vec<CRec<K>>>> = cl_chunks
+        .par_iter()
+        .map(|c| {
+            let d = c.data;
+            let cap = d.len() / 45 / NB + 4;
+            let mut out: Vec<Vec<CRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            scan::<4, _>(d, c.skip_first, |fl| {
+                if fl[0].empty() || fl[1].empty() || fl[2].empty() {
+                    return;
+                }
+                let Some(camp) = K::make(d, fl[2].s, fl[2].e).and_then(|k| campaigns.get(&k).copied()) else {
+                    return;
+                };
+                let Some(ts) = parse_ts(&d[fl[3].s..fl[3].e]) else { return };
+                if ts < ws - WEEK || ts >= we {
+                    return;
+                }
+                let (Some(id), Some(uid)) = (K::make(d, fl[0].s, fl[0].e), K::make(d, fl[1].s, fl[1].e)) else {
+                    fail.store(true, Relaxed);
+                    return;
+                };
+                let name = person_of(uid);
+                out[shard_of(&name)].push(CRec { name, id, ts, camp });
+            });
+            out
+        })
+        .collect();
+    if fail.load(Relaxed) {
+        return false;
+    }
+    log(t0, "clicks parsed");
+
+    // ---- Dedup each event_id shard; reshard survivors by person.
+    let dedup: Vec<Vec<Vec<PRec<K>>>> = (0..NB)
         .into_par_iter()
         .map(|b| {
             let n: usize = parsed.iter().map(|c| c[b].len()).sum();
-            let mut best: FxHashMap<&[u8], ERec> = new_map(n);
+            let mut best: FxHashMap<K, ERec<K>> = new_map(n);
             for c in &parsed {
                 for r in &c[b] {
                     match best.entry(r.id) {
@@ -550,10 +796,10 @@ fn run<'a>(
                     }
                 }
             }
-            let mut out: Vec<Vec<PRec>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 4)).collect();
+            let mut out: Vec<Vec<PRec<K>>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 4)).collect();
             for r in best.values() {
-                if r.valid {
-                    out[shard_of(r.name)].push(PRec { name: r.name, ts: r.ts, price: r.price, cat: r.cat });
+                if r.cat != INVALID {
+                    out[shard_of(&r.name)].push(PRec { name: r.name, ts: r.ts, price: r.price, cat: r.cat });
                 }
             }
             out
@@ -562,36 +808,11 @@ fn run<'a>(
     drop(parsed);
     log(t0, "events deduped");
 
-    // ---- Clicks: parse + validate, scatter by hash(person).
-    let cl_chunks = make_chunks(cl_bufs, target);
-    let clicks: Vec<Vec<Vec<CRec>>> = cl_chunks
-        .par_iter()
-        .map(|c| {
-            let cap = c.data.len() / 45 / NB + 4;
-            let mut out: Vec<Vec<CRec>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
-            for_each_line(c.data, c.skip_first, |line| {
-                let mut f: [&[u8]; 4] = [&[]; 4];
-                if !split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let Some(&camp) = campaigns.get(f[2]) else { return };
-                let Some(ts) = parse_ts(f[3]) else { return };
-                if ts < ws - WEEK || ts >= we {
-                    return;
-                }
-                let name = person_of(f[1]);
-                out[shard_of(name)].push(CRec { name, id: f[0], ts, camp });
-            });
-            out
-        })
-        .collect();
-    log(t0, "clicks parsed");
-
     // ---- Per person shard: sessions, credit, assists, aggregates.
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let size = (ncamp + 1) * ndays;
-    let results: Vec<(Vec<URow>, Vec<[i64; 4]>)> = (0..NB)
+    let results: Vec<(Vec<URow<K>>, Vec<[i64; 4]>)> = (0..NB)
         .into_par_iter()
         .fold(
             || (Vec::new(), vec![[0i64; 4]; size]),
@@ -622,10 +843,10 @@ fn run<'a>(
     // Pack the per-split row lists into at most `threads` files of similar size.
     let nrows: usize = results.iter().map(|(u, _)| u.len()).sum();
     let per_file = nrows.div_ceil(threads).max(1);
-    let mut groups: Vec<Vec<&[URow]>> = vec![Vec::new()];
+    let mut groups: Vec<Vec<&[URow<K>]>> = vec![Vec::new()];
     let mut in_group = 0usize;
     for (u, _) in &results {
-        let mut rest: &[URow] = u;
+        let mut rest: &[URow<K>] = u;
         while !rest.is_empty() {
             if in_group == per_file {
                 groups.push(Vec::new());
@@ -637,27 +858,29 @@ fn run<'a>(
             rest = &rest[take..];
         }
     }
+    let camp_names: Vec<(&[u8], &[u8])> = camp_rows.iter().map(|r| (r.1, r.2)).collect();
     rayon::join(
         || {
             groups.par_iter().enumerate().for_each(|(i, parts)| {
                 write_user(&ud.join(format!("part-{i:05}.parquet")), parts, &cat_names);
             })
         },
-        || write_campaign(&cd.join("part-00000.parquet"), &camp_tot, &camp_rows, ncamp, ndays, day0),
+        || write_campaign(&cd.join("part-00000.parquet"), &camp_tot, &camp_names, ncamp, ndays, day0),
     );
     log(t0, &format!("wrote {nrows} user rows in {} files", groups.len()));
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_shard<'a>(
+fn process_shard<'a, K: Key<'a>>(
     p: usize,
-    dedup: &[Vec<Vec<PRec<'a>>>],
-    clicks: &[Vec<Vec<CRec<'a>>>],
+    dedup: &[Vec<Vec<PRec<K>>>],
+    clicks: &[Vec<Vec<CRec<K>>>],
     day0: i64,
     ndays: usize,
     ncat: usize,
     organic: usize,
-    urows: &mut Vec<URow<'a>>,
+    urows: &mut Vec<URow<K>>,
     camp: &mut [[i64; 4]],
 ) {
     // Group events by person (counting sort into one flat array).
@@ -665,8 +888,8 @@ fn process_shard<'a>(
     if n_ev == 0 {
         return;
     }
-    let mut index: FxHashMap<&[u8], u32> = new_map(n_ev / 8 + 16);
-    let mut names: Vec<&[u8]> = Vec::new();
+    let mut index: FxHashMap<K, u32> = new_map(n_ev / 8 + 16);
+    let mut names: Vec<K> = Vec::new();
     let mut cnt: Vec<u32> = Vec::new();
     let mut pid_of: Vec<u32> = Vec::with_capacity(n_ev);
     for d in dedup {
@@ -705,7 +928,7 @@ fn process_shard<'a>(
     let mut cpid: Vec<u32> = Vec::new();
     for c in clicks {
         for r in &c[p] {
-            match index.get(r.name) {
+            match index.get(&r.name) {
                 Some(&id) => {
                     ccnt[id as usize] += 1;
                     cpid.push(id);
@@ -718,7 +941,7 @@ fn process_shard<'a>(
     for i in 0..np {
         cl_off[i + 1] = cl_off[i] + ccnt[i] as usize;
     }
-    let mut cls: Vec<Cl> = vec![Cl { ts: 0, id: &[], camp: 0 }; cl_off[np]];
+    let mut cls: Vec<Cl<K>> = vec![Cl::default(); cl_off[np]];
     {
         let mut cur = cl_off.clone();
         let mut k = 0;
@@ -747,7 +970,7 @@ fn process_shard<'a>(
         let ev = &mut evs[ev_off[pid]..ev_off[pid + 1]];
         ev.sort_unstable_by_key(|e| e.ts);
         let cl = &mut cls[cl_off[pid]..cl_off[pid + 1]];
-        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(b.id)));
+        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
         let n = ev.len();
         let m = cl.len();
         starts.clear();
@@ -755,7 +978,7 @@ fn process_shard<'a>(
 
         let mut cur_day = u32::MAX;
         let (mut u_sess, mut u_ev, mut u_rev) = (0i64, 0i64, 0i64);
-        let flush = |day: u32, s: i64, e: i64, r: i64, catsum: &mut [u64], touched: &mut Vec<u32>, urows: &mut Vec<URow<'a>>| {
+        let flush = |day: u32, s: i64, e: i64, r: i64, catsum: &mut [u64], touched: &mut Vec<u32>, urows: &mut Vec<URow<K>>| {
             let mut top: Option<u32> = None;
             let mut best = 0u64;
             for &c in touched.iter() {
@@ -883,8 +1106,8 @@ fn bytes(v: &[u8]) -> ByteArray {
     ByteArray::from(v.to_vec())
 }
 
-fn write_user(path: &Path, parts: &[&[URow]], cat_names: &[&[u8]]) {
-    let rows: Vec<&URow> = parts.iter().flat_map(|p| p.iter()).collect();
+fn write_user<'a, K: Key<'a>>(path: &Path, parts: &[&[URow<K>]], cat_names: &[&[u8]]) {
+    let rows: Vec<&URow<K>> = parts.iter().flat_map(|p| p.iter()).collect();
     let schema = parse_message_type(
         "message user_daily {
             REQUIRED BYTE_ARRAY user_id (STRING);
@@ -901,7 +1124,15 @@ fn write_user(path: &Path, parts: &[&[URow]], cat_names: &[&[u8]]) {
     let mut w = SerializedFileWriter::new(file, Arc::new(schema), Arc::new(props)).unwrap();
     if !rows.is_empty() {
         let mut rg = w.next_row_group().unwrap();
-        put::<ByteArrayType, _>(&mut rg, &rows.iter().map(|r| bytes(r.name)).collect::<Vec<_>>(), None);
+        let names: Vec<ByteArray> = rows
+            .iter()
+            .map(|r| {
+                let mut b = Vec::with_capacity(16);
+                r.name.put(&mut b);
+                ByteArray::from(b)
+            })
+            .collect();
+        put::<ByteArrayType, _>(&mut rg, &names, None);
         put::<Int32Type, _>(&mut rg, &rows.iter().map(|r| r.day).collect::<Vec<_>>(), None);
         put::<Int64Type, _>(&mut rg, &rows.iter().map(|r| r.sessions).collect::<Vec<_>>(), None);
         put::<Int64Type, _>(&mut rg, &rows.iter().map(|r| r.events).collect::<Vec<_>>(), None);
@@ -914,7 +1145,7 @@ fn write_user(path: &Path, parts: &[&[URow]], cat_names: &[&[u8]]) {
     w.close().unwrap();
 }
 
-fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_rows: &[[&[u8]; 2]], ncamp: usize, ndays: usize, day0: i64) {
+fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_names: &[(&[u8], &[u8])], ncamp: usize, ndays: usize, day0: i64) {
     let schema = parse_message_type(
         "message campaign_daily {
             REQUIRED BYTE_ARRAY campaign_id (STRING);
@@ -935,7 +1166,7 @@ fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_rows: &[[&[u8]; 2]], ncamp
             if t[0] == 0 && t[3] == 0 {
                 continue;
             }
-            let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (camp_rows[c][0], camp_rows[c][1]) };
+            let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { camp_names[c] };
             ids.push(bytes(id));
             chans.push(bytes(ch));
             days.push((day0 + d as i64) as i32);

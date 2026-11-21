@@ -3,7 +3,9 @@
 
 Same flags as the starter's docker_run.sh, in Python so it also runs on Windows.
 Resource limits come from CPUS (default 8) and MEM (default 24g); a laptop with
-less memory for Docker can pass MEM=12g. Prints the wall time to stderr.
+less memory for Docker can pass MEM=12g, and CPUSET=0-7 pins the CPUs as the
+scorer does. KEYS=128 or KEYS=slice forces the pipeline's fallback key types.
+Prints the wall time to stderr.
 
 DATA_DIR or OUTPUT_DIR may be `vol:<volume>/<path>` to use a Docker volume
 instead of a host folder. On Docker Desktop (Windows, macOS) host folders go
@@ -43,11 +45,15 @@ def main():
             "docker", "run", "--rm", "--platform", "linux/amd64",
             "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,size=64m,mode=1777",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-            "--pids-limit", "4096", "--cpus", cpus, "--memory", mem, "--memory-swap", mem,
+            "--pids-limit", "4096", "--memory", mem, "--memory-swap", mem,
+            # The scorer pins 8 hyperthreads; CPUSET=0-7 does the same (on a hybrid
+            # Intel laptop that keeps the run off the slow efficiency cores).
+            *(["--cpuset-cpus", os.environ["CPUSET"]] if os.environ.get("CPUSET") else ["--cpus", cpus]),
             "--user", "1000:1000",
             *data_mount, *out_mount, "-v", f"{scratch}:/scratch",
             "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
             "-e", "HOME=/scratch", "-e", f"NCPU={cpus.split('.')[0]}", "-e", f"MEM_GB={mem.rstrip('g')}",
+            *(["-e", f"KEYS={os.environ['KEYS']}"] if os.environ.get("KEYS") else []),
             image,
         ]
         start = time.monotonic()

@@ -1,6 +1,8 @@
 # Shopping Sessions: Rust pipeline. The scorer builds this natively on linux/amd64.
 FROM rust:1.85-bookworm AS build
 WORKDIR /build
+# The scorers are Cascade Lake or newer; x86-64-v3 (AVX2, BMI2) runs there and on most dev machines.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 
 # Build the dependencies first so code changes do not rebuild them.
 COPY pipeline/Cargo.toml pipeline/Cargo.lock ./
