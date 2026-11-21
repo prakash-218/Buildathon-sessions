@@ -232,6 +232,22 @@ fn product_number(s: &[u8]) -> Option<usize> {
     Some(v)
 }
 
+/// "Campaign ID `c_<digits>` in canonical form (no leading zero)" -> its number.
+#[inline(always)]
+fn campaign_number(s: &[u8]) -> Option<usize> {
+    if s.len() < 3 || s.len() > 8 || s[0] != b'c' || s[1] != b'_' || (s.len() > 3 && s[2] == b'0') {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in &s[2..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as usize;
+    }
+    Some(v)
+}
+
 /// Room for one shard's share of `bytes` of input at `per_line` bytes a line:
 /// the mean plus 4 standard deviations, so shard vectors rarely outgrow it
 /// (each growth copies the whole vector).
@@ -347,7 +363,10 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
         if quotes != 0 {
             let mut wrapped = 0u64;
             for x in fl.iter_mut() {
-                if x.e >= x.s + 2 && d[x.s] == b'"' && d[x.e - 1] == b'"' {
+                if x.e > x.s && d[x.s] == b'"' {
+                    if x.e < x.s + 2 || d[x.e - 1] != b'"' {
+                        return; // opens with a quote but does not close with one
+                    }
                     *x = Fd { s: x.s + 1, e: x.e - 1 };
                     wrapped += 2;
                 }
@@ -971,6 +990,8 @@ struct Catalog<'a, K> {
     /// (key, campaign_id, channel), in file order; a campaign's index is its place here.
     camp_rows: Vec<(K, &'a [u8], &'a [u8])>,
     campaigns: FxHashMap<K, u32>,
+    /// Canonical `c_<digits>` IDs by number (u32::MAX = not a campaign); empty if unusable.
+    camp_arr: Vec<u32>,
     ncamp: usize,
 }
 
@@ -1017,7 +1038,30 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
         });
         let campaigns: FxHashMap<K, u32> = camp_rows.iter().enumerate().map(|(i, r)| (r.0, i as u32)).collect();
         let ncamp = camp_rows.len();
-        ok.then_some(Catalog { cat_names, ncat, unknown, products, prod_arr, camp_rows, campaigns, ncamp })
+        let mut camp_arr: Vec<u32> = Vec::new();
+        let max = camp_rows.iter().filter_map(|r| campaign_number(r.1)).max().unwrap_or(0);
+        if max < (1 << 20) {
+            camp_arr = vec![u32::MAX; max + 1];
+            for (i, r) in camp_rows.iter().enumerate() {
+                if let Some(n) = campaign_number(r.1) {
+                    camp_arr[n] = i as u32;
+                }
+            }
+        }
+        ok.then_some(Catalog { cat_names, ncat, unknown, products, prod_arr, camp_rows, campaigns, camp_arr, ncamp })
+    }
+
+    /// The campaign index of `d[f.s..f.e]`, or None if it is not in campaigns.csv.
+    /// Canonical `c_<digits>` IDs are looked up in the array and only there.
+    #[inline(always)]
+    fn campaign_of(&self, d: &'a [u8], f: Fd) -> Option<u32> {
+        let s = &d[f.s..f.e];
+        if !self.camp_arr.is_empty() {
+            if let Some(n) = campaign_number(s) {
+                return self.camp_arr.get(n).copied().filter(|&c| c != u32::MAX);
+            }
+        }
+        K::make(d, f.s, f.e).and_then(|k| self.campaigns.get(&k).copied())
     }
 
     #[inline(always)]

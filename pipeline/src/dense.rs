@@ -227,6 +227,9 @@ fn solve_key(pairs: &[(u64, u64)], dmax: u64, score: impl Fn(u64) -> f64) -> Opt
                     }
                 }
                 let s = score(k);
+                if s >= 0.99 {
+                    return Some((k, s)); // a wrong key scores near zero
+                }
                 if best.is_none_or(|(_, b)| s > b) {
                     best = Some((k, s));
                 }
@@ -599,7 +602,8 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                         }
                     };
                     ts = (t - ws) as u32;
-                    info = price | cat.category_of(d, fl[5]) << 24;
+                    // Categories only matter for purchases (top_category sums purchase prices).
+                    info = if price > 0 { price | cat.category_of(d, fl[5]) << 24 } else { 0 };
                 }
                 let num = (d[fl[0].s] == b'e').then(|| b36(d, fl[0].s + 1, fl[0].e)).flatten().map(|y| unscramble(y, ekey));
                 match num {
@@ -782,7 +786,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
                 }
-                let Some(camp) = <u64 as Key<'_>>::make(d, fl[2].s, fl[2].e).and_then(|k| cat.campaigns.get(&k).copied()) else {
+                let Some(camp) = cat.campaign_of(d, fl[2]) else {
                     return;
                 };
                 let Some(ts) = ts_at(d, fl[3]) else { return };
