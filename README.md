@@ -20,7 +20,7 @@ Our entry for the Builders Buildathon Databricks track: turn messy click-stream 
 1. mmap every input file and cut them all into line-aligned chunks, so 8 threads share the parsing however the file sizes are skewed. Each chunk is scanned once with AVX2: 64 bytes at a time become newline, comma and quote bitmasks, and the parser walks the bits.
    IDs are packed into integers that keep byte-wise order: `u64` (up to 9 ASCII bytes, which covers every generated ID), else `u128` (up to 15 bytes), else the run is redone with byte-slice keys. `KEYS=128` or `KEYS=slice` forces a fallback, for testing.
 2. Links: IDs are numbered in 256 hash shards in parallel, union-find runs over the numbers, and each person is named by its byte-wise smallest ID.
-   A 2 MB bit filter marks the IDs that are not their person's name, so most rows skip the ID -> name maps.
+   ID -> name lives in 256 open-addressing tables of (ID, name) pairs, one per hash shard. Parsing issues each row's lookup 16 rows ahead: the slot's address follows from the hash, so it is prefetched, and the row waits in a small ring until its cache line has arrived.
 3. Events: every copy is parsed and validated in parallel. A valid copy's 24-byte payload is written once, straight into its person's shard; every copy also sends (`event_id`, `ingest_ts`, payload location) to its `event_id` shard. Dedup keeps the copy with the smallest `ingest_ts` per ID and marks every other copy's payload dead in place (each payload belongs to one `event_id` shard, so no two threads write it). Canonical `p<digits>` product IDs are looked up in a small array.
 4. Clicks: validated and sharded by person. No dedup: copies are identical, so they cannot change a credit or an assist.
 5. Per person (dead payloads skipped): sort, split sessions on gaps over 30 min, credit each session with a two-pointer over the clicks, and count assists by merging each campaign's `[t, t + 7 days]` windows into intervals.
@@ -39,7 +39,7 @@ Memory comes from mimalloc with `MIMALLOC_PURGE_DELAY=-1` (set in the Dockerfile
 | Seeds 2, 3 (1M events) and 11 (5M events) vs the reference | exact match |
 | 20M events (seed 7), local laptop, 8 CPUs | 4.3 to 4.8 s in the container; about 16k page faults |
 
-The track's baseline is 171.91 s. Practice board: a6ee49b (first version) 4.09 s; 581d3f3 (AVX2 parser, packed keys) 2.07 s; f1a698d (parallel links, mimalloc, buffer reuse) 1.64 s; a17ca33 (write-once events, renamed-ID filter) 1.51 s; a50022a (SWAR timestamps) 1.41 s.
+The track's baseline is 171.91 s. Practice board: a6ee49b (first version) 4.09 s; 581d3f3 (AVX2 parser, packed keys) 2.07 s; f1a698d (parallel links, mimalloc, buffer reuse) 1.64 s; a17ca33 (write-once events, renamed-ID filter) 1.51 s; a50022a (SWAR timestamps) 1.41 s; 3ee256d (scratch image) 1.59 s; c45852b (own Parquet writer) 1.40 s. The scorer's machines differ by up to 20%, so compare builds side by side locally.
 
 Local wall times on a laptop under WSL2 swing by ±30%, so page faults (`perf stat -e page-faults`, deterministic) and profiles are better guides than single timings.
 

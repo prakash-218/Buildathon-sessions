@@ -151,7 +151,65 @@ fn shard_of<T: Hash>(k: &T) -> usize {
     (mix(k) >> 56) as usize & (NB - 1)
 }
 
-const FILTER_BITS: usize = 1 << 24; // 2 MB
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    // A prefetch never faults, so any address is fine.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+    }
+}
+
+/// ID -> person name, for the IDs that are not their person's own name. Open
+/// addressing with linear probing and (key, value) pairs side by side, so a
+/// lookup usually reads one cache line, whose address is known from the hash
+/// alone: callers prefetch it a few rows ahead. Empty slots hold
+/// `K::default()`, which no ID can equal (IDs are never empty).
+struct LinkTable<K> {
+    slots: Vec<(K, K)>,
+    mask: usize,
+}
+
+impl<'a, K: Key<'a>> LinkTable<K> {
+    fn new(entries: &[(K, K)]) -> Self {
+        let cap = (entries.len() * 2 + 2).next_power_of_two().max(8); // load <= 1/2
+        let mask = cap - 1;
+        let mut slots = vec![(K::default(), K::default()); cap];
+        for &(k, v) in entries {
+            let mut i = mix(&k) as usize & mask;
+            while slots[i].0 != K::default() {
+                i = (i + 1) & mask;
+            }
+            slots[i] = (k, v);
+        }
+        LinkTable { slots, mask }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        prefetch(self.slots.as_ptr().wrapping_add(h as usize & self.mask));
+    }
+
+    /// The name of `k` (whose `mix` is `h`): its entry, or `k` itself.
+    #[inline(always)]
+    fn get(&self, k: K, h: u64) -> K {
+        let mut i = h as usize & self.mask;
+        loop {
+            let s = &self.slots[i];
+            if s.0 == k {
+                return s.1;
+            }
+            if s.0 == K::default() {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// How many rows a person lookup is issued ahead of its use.
+const AHEAD: usize = 16;
 
 /// "Product ID `p<digits>` in canonical form (no leading zero)" -> its number.
 /// Such IDs are looked up in a small array instead of a hash map.
@@ -608,8 +666,20 @@ struct PRec<K> {
 #[derive(Clone, Copy)]
 struct SendPtr(usize);
 
+/// A valid event copy waiting AHEAD rows for its person lookup.
+#[derive(Clone, Copy, Default)]
+struct EvPend<K> {
+    id: K,
+    uid: K,
+    ingest: i64,
+    ts: i64,
+    h: u64, // mix(uid)
+    price: u32,
+    cat: u32,
+}
+
 /// A valid click, keyed by person.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct CRec<K> {
     name: K,
     id: K,
@@ -911,43 +981,28 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             }
         }
     }
-    // ID -> name, only for IDs that are not their person's name, sharded like the IDs.
-    let link_maps: Vec<FxHashMap<K, K>> = id_shards
+    // ID -> name, only for IDs that are not their person's name, sharded like the
+    // IDs (by the top 8 bits of `mix`), each shard its own table, built in parallel.
+    let links: Vec<LinkTable<K>> = id_shards
         .par_iter()
         .enumerate()
         .map(|(s, (keys, _))| {
-            let mut m = new_map(keys.len());
-            for (i, &k) in keys.iter().enumerate() {
-                let nm = name[roots[base[s] as usize + i] as usize].unwrap();
-                if nm != k {
-                    m.insert(k, nm);
-                }
-            }
-            m
+            let entries: Vec<(K, K)> = keys
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| {
+                    let nm = name[roots[base[s] as usize + i] as usize].unwrap();
+                    (nm != k).then_some((k, nm))
+                })
+                .collect();
+            LinkTable::new(&entries)
         })
         .collect();
     drop(id_shards);
     drop(name);
     drop(roots);
-    let renamed: usize = link_maps.iter().map(|m| m.len()).sum();
-    // Bit filter of the renamed IDs: a clear bit means "not renamed" for sure, so
-    // most rows skip the maps (which are too big for cache) entirely.
-    let mut filter = vec![0u64; FILTER_BITS / 64];
-    for m in &link_maps {
-        for k in m.keys() {
-            let b = mix(k) as usize & (FILTER_BITS - 1);
-            filter[b >> 6] |= 1 << (b & 63);
-        }
-    }
-    log(t0, &format!("links: {nid} ids, {renamed} renamed"));
-    let person_of = |uid: K| -> K {
-        let h = mix(&uid);
-        let b = h as usize & (FILTER_BITS - 1);
-        if filter[b >> 6] >> (b & 63) & 1 == 0 {
-            return uid;
-        }
-        link_maps[(h >> 56) as usize & (NB - 1)].get(&uid).copied().unwrap_or(uid)
-    };
+    log(t0, &format!("links: {nid} ids"));
+    let table_of = |h: u64| -> &LinkTable<K> { &links[(h >> 56) as usize & (NB - 1)] };
 
     // ---- Events: parse every copy. A valid copy's payload is written once,
     // straight into its person's shard; every copy also sends (id, ingest, where
@@ -962,6 +1017,20 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             let cap = shard_cap(d.len(), 72);
             let mut drec: Vec<Vec<DRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
             let mut pay: Vec<Vec<PRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            // Valid copies wait AHEAD rows in this ring while their person's table
+            // slot is prefetched; then `finish` looks the person up and stores them.
+            let mut ring = [EvPend::<K>::default(); AHEAD];
+            let (mut head, mut queued) = (0usize, 0usize);
+            let finish = |e: &EvPend<K>, pay: &mut Vec<Vec<PRec<K>>>, drec: &mut Vec<Vec<DRec<K>>>| {
+                let name = table_of(e.h).get(e.uid, e.h);
+                // Not renamed: the name is the ID, and so is its hash.
+                let p = if name == e.uid { (e.h >> 56) as usize & (NB - 1) } else { shard_of(&name) };
+                let v = &mut pay[p];
+                assert!(v.len() < 1 << 32);
+                let loc = (ci as u64) << 40 | (p as u64) << 32 | v.len() as u64;
+                v.push(PRec { name, ts: e.ts, price: e.price, cat: e.cat });
+                drec[shard_of(&e.id)].push(DRec { id: e.id, ingest: e.ingest, loc });
+            };
             scan::<7, _>(d, c.skip_first, |fl| {
                 if fl[0].empty() {
                     return;
@@ -971,7 +1040,6 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     return;
                 };
                 let ingest = parse_ts(&d[fl[3].s..fl[3].e]).unwrap_or(i64::MAX);
-                let mut loc = NO_LOC;
                 'v: {
                     if fl[1].empty() || fl[5].empty() {
                         break 'v;
@@ -995,15 +1063,25 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                         fail.store(true, Relaxed);
                         break 'v;
                     };
-                    let name = person_of(uid);
-                    let p = shard_of(&name);
-                    let v = &mut pay[p];
-                    assert!(v.len() < 1 << 32);
-                    loc = (ci as u64) << 40 | (p as u64) << 32 | v.len() as u64;
-                    v.push(PRec { name, ts, price, cat: category_of(d, fl[5]) });
+                    let h = mix(&uid);
+                    table_of(h).prefetch(h);
+                    let e = EvPend { id, uid, ingest, ts, h, price, cat: category_of(d, fl[5]) };
+                    if queued == AHEAD {
+                        finish(&ring[head], &mut pay, &mut drec);
+                        ring[head] = e;
+                        head = (head + 1) % AHEAD;
+                    } else {
+                        ring[(head + queued) % AHEAD] = e;
+                        queued += 1;
+                    }
+                    return;
                 }
-                drec[shard_of(&id)].push(DRec { id, ingest, loc });
+                // An invalid copy: no payload, but it still takes part in dedup.
+                drec[shard_of(&id)].push(DRec { id, ingest, loc: NO_LOC });
             });
+            for k in 0..queued {
+                finish(&ring[(head + k) % AHEAD], &mut pay, &mut drec);
+            }
             (drec, pay)
         })
         .collect();
@@ -1021,6 +1099,15 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             let d = c.data;
             let cap = shard_cap(d.len(), 46);
             let mut out: Vec<Vec<CRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            // Same prefetch ring as for events: (click, user id hash) waits AHEAD rows.
+            let mut ring = [(CRec::<K>::default(), 0u64); AHEAD];
+            let (mut head, mut queued) = (0usize, 0usize);
+            let finish = |(c, h): &(CRec<K>, u64), out: &mut Vec<Vec<CRec<K>>>| {
+                let uid = c.name; // still the user id; becomes the person here
+                let name = table_of(*h).get(uid, *h);
+                let p = if name == uid { (*h >> 56) as usize & (NB - 1) } else { shard_of(&name) };
+                out[p].push(CRec { name, ..*c });
+            };
             scan::<4, _>(d, c.skip_first, |fl| {
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
@@ -1036,9 +1123,21 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     fail.store(true, Relaxed);
                     return;
                 };
-                let name = person_of(uid);
-                out[shard_of(&name)].push(CRec { name, id, ts, camp });
+                let h = mix(&uid);
+                table_of(h).prefetch(h);
+                let e = (CRec { name: uid, id, ts, camp }, h);
+                if queued == AHEAD {
+                    finish(&ring[head], &mut out);
+                    ring[head] = e;
+                    head = (head + 1) % AHEAD;
+                } else {
+                    ring[(head + queued) % AHEAD] = e;
+                    queued += 1;
+                }
             });
+            for k in 0..queued {
+                finish(&ring[(head + k) % AHEAD], &mut out);
+            }
             out
         })
         .collect();
