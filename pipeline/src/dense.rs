@@ -127,8 +127,9 @@ fn b36x2(d: &[u8], a: Fd, pa: u8, b: Fd, pb: u8) -> (Option<u64>, Option<u64>) {
         let one = |f: Fd, p: u8| (f.e > f.s && d[f.s] == p).then(|| b36(d, f.s + 1, f.e)).flatten();
         return (one(a, pa), one(b, pb));
     }
-    let wa = u64::from_le_bytes(d[a.e - 8..a.e].try_into().unwrap());
-    let wb = u64::from_le_bytes(d[b.e - 8..b.e].try_into().unwrap());
+    // SAFETY: 9 <= e <= d.len() for both fields, so the 8 bytes before e are in d.
+    let wa = unsafe { (d.as_ptr().add(a.e - 8) as *const u64).read_unaligned() };
+    let wb = unsafe { (d.as_ptr().add(b.e - 8) as *const u64).read_unaligned() };
     let (ka, kb) = (!0u64 << (8 * (8 - na)), !0u64 << (8 * (8 - nb)));
     let wa = (wa & ka) | (0x30 * ONES & !ka);
     let wb = (wb & kb) | (0x30 * ONES & !kb);
@@ -147,8 +148,8 @@ fn b36x2(d: &[u8], a: Fd, pa: u8, b: Fd, pb: u8) -> (Option<u64>, Option<u64>) {
         (ok, [_mm_cvtsi128_si64(r) as u64, _mm_extract_epi64::<1>(r) as u64])
     };
     let lead0 = |w: u64, n: usize| n > 1 && (w >> (8 * (8 - n))) as u8 == b'0';
-    let ra = (d[a.s] == pa && ok & 0xff == 0xff && !lead0(wa, na) && r[0] <= MASK).then_some(r[0]);
-    let rb = (d[b.s] == pb && ok >> 8 == 0xff && !lead0(wb, nb) && r[1] <= MASK).then_some(r[1]);
+    let ra = (at(d, a.s) == pa && ok & 0xff == 0xff && !lead0(wa, na) && r[0] <= MASK).then_some(r[0]);
+    let rb = (at(d, b.s) == pb && ok >> 8 == 0xff && !lead0(wb, nb) && r[1] <= MASK).then_some(r[1]);
     (ra, rb)
 }
 
@@ -751,9 +752,9 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     if t < ws || t >= we {
                         break 'v;
                     }
-                    let price = match purchase_kind(&d[fl[4].s..fl[4].e]) {
+                    let price = match purchase_kind(fld(d, fl[4])) {
                         Some(false) => 0,
-                        Some(true) => match parse_price(&d[fl[6].s..fl[6].e]) {
+                        Some(true) => match parse_price(fld(d, fl[6])) {
                             Some(p) => p,
                             None => break 'v,
                         },
@@ -877,26 +878,28 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     let survivors: Vec<Vec<SRec>> = (0..nsh)
         .into_par_iter()
         .map_init(
-            || vec![u64::MAX; 1 << SH],
-            |best, q| {
-                best.fill(u64::MAX);
+            || vec![[u32::MAX, 0, 0, 0]; 1 << SH],
+            |slots, q| {
+                // Each event number's slot keeps its earliest copy so far:
+                // (ingest, ts, user, info). An ingest_ts that does not parse is
+                // u32::MAX, like an empty slot: such a copy never wins, and as the
+                // kept copy it would be invalid anyway (late), so nothing changes.
+                for s in slots.iter_mut() {
+                    s[0] = u32::MAX;
+                }
                 let base = (q as u32) << SH;
-                for (t, o) in ev_out.iter().enumerate() {
-                    for (j, r) in o.shards[q].iter().enumerate() {
-                        let k = (r.ingest as u64) << 32 | (t as u64) << 27 | j as u64;
-                        let slot = &mut best[(r.i - base) as usize];
-                        if k < *slot {
-                            *slot = k; // equal ingest_ts means identical copies: keep either
+                for o in &ev_out {
+                    for r in &o.shards[q] {
+                        let s = &mut slots[(r.i - base) as usize];
+                        if r.ingest < s[0] {
+                            *s = [r.ingest, r.ts, r.user, r.info]; // equal ingest_ts: identical copies, keep either
                         }
                     }
                 }
                 let mut surv = Vec::with_capacity(1 << SH);
-                for &k in best.iter() {
-                    if k != u64::MAX {
-                        let r = &ev_out[(k >> 27 & 31) as usize].shards[q][(k & ((1 << 27) - 1)) as usize];
-                        if r.ts != NO_TS {
-                            surv.push(SRec { ts: r.ts, user: r.user, info: r.info });
-                        }
+                for s in slots.iter() {
+                    if s[0] != u32::MAX && s[1] != NO_TS {
+                        surv.push(SRec { ts: s[1], user: s[2], info: s[3] });
                     }
                 }
                 let mut last = u32::MAX;

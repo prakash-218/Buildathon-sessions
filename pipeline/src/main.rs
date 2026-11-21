@@ -332,14 +332,31 @@ fn bits_between(lo: usize, hi: usize) -> u64 {
 /// field (and nowhere inside it). Malformed and empty lines are skipped, and so
 /// is the first line when `skip_first` (the file's header).
 ///
+/// `d[f.s..f.e]` without bounds checks: every Fd the scanners make lies
+/// inside the buffer it came from (s <= e <= len).
+#[inline(always)]
+fn fld(d: &[u8], f: Fd) -> &[u8] {
+    debug_assert!(f.s <= f.e && f.e <= d.len());
+    // SAFETY: see above.
+    unsafe { d.get_unchecked(f.s..f.e) }
+}
+
+/// `d[i]` without a bounds check, for `i < d.len()`.
+#[inline(always)]
+fn at(d: &[u8], i: usize) -> u8 {
+    debug_assert!(i < d.len());
+    // SAFETY: i < d.len().
+    unsafe { *d.get_unchecked(i) }
+}
+
 /// Strip the quotes of the fields that open with one; false unless they all
 /// close with one and those are all of the line's `quotes`.
 #[inline(always)]
 fn unwrap_quotes<const N: usize>(d: &[u8], fl: &mut [Fd; N], quotes: u64) -> bool {
     let mut wrapped = 0u64;
     for x in fl.iter_mut() {
-        if x.e > x.s && d[x.s] == b'"' {
-            if x.e < x.s + 2 || d[x.e - 1] != b'"' {
+        if x.e > x.s && at(d, x.s) == b'"' {
+            if x.e < x.s + 2 || at(d, x.e - 1) != b'"' {
                 return false; // opens with a quote but does not close with one
             }
             *x = Fd { s: x.s + 1, e: x.e - 1 };
@@ -637,15 +654,15 @@ fn ts_at(d: &[u8], f: Fd) -> Option<i64> {
     {
         let n = f.e - f.s;
         if n == 20 || n == 25 {
-            if let Some(v) = iso_sse(&d[f.s..f.e]) {
+            if let Some(v) = iso_sse(fld(d, f)) {
                 return Some(v);
             }
         } else if (1..=16).contains(&n) && f.e >= 16 {
             // Shorter than F1, so only F3 can be valid.
-            return digits_sse(&d[f.e - 16..f.e], n).map(|v| v as i64);
+            return digits_sse(fld(d, Fd { s: f.e - 16, e: f.e }), n).map(|v| v as i64);
         }
     }
-    parse_ts(&d[f.s..f.e])
+    parse_ts(fld(d, f))
 }
 
 /// F1 or F2 (`s` is 20 or 25 bytes) -> epoch ms, or None to let the exact
@@ -676,20 +693,20 @@ fn iso_sse(s: &[u8]) -> Option<i64> {
             _mm_extract_epi16::<5>(w) as i64,
         )
     };
-    let (s1, s2) = (s[17].wrapping_sub(b'0'), s[18].wrapping_sub(b'0'));
-    if s[16] != b':' || s1 > 9 || s2 > 9 {
+    let (s1, s2) = (at(s, 17).wrapping_sub(b'0'), at(s, 18).wrapping_sub(b'0'));
+    if at(s, 16) != b':' || s1 > 9 || s2 > 9 {
         return None;
     }
     let se = (s1 * 10 + s2) as i64;
     let off = if n == 20 {
-        if s[19] != b'Z' {
+        if at(s, 19) != b'Z' {
             return None;
         }
         0
     } else {
-        let (sign, a, b) = (s[19], s[20].wrapping_sub(b'0'), s[21].wrapping_sub(b'0'));
-        let (c, e) = (s[23].wrapping_sub(b'0'), s[24].wrapping_sub(b'0'));
-        if (sign != b'+' && sign != b'-') || s[22] != b':' || a > 9 || b > 9 || c > 9 || e > 9 {
+        let (sign, a, b) = (at(s, 19), at(s, 20).wrapping_sub(b'0'), at(s, 21).wrapping_sub(b'0'));
+        let (c, e) = (at(s, 23).wrapping_sub(b'0'), at(s, 24).wrapping_sub(b'0'));
+        if (sign != b'+' && sign != b'-') || at(s, 22) != b':' || a > 9 || b > 9 || c > 9 || e > 9 {
             return None;
         }
         let (oh, om) = ((a * 10 + b) as i64, (c * 10 + e) as i64);
@@ -1117,7 +1134,7 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
     /// Canonical `c_<digits>` IDs are looked up in the array and only there.
     #[inline(always)]
     fn campaign_of(&self, d: &'a [u8], f: Fd) -> Option<u32> {
-        let s = &d[f.s..f.e];
+        let s = fld(d, f);
         if !self.camp_arr.is_empty() {
             if let Some(n) = campaign_number(s) {
                 return self.camp_arr.get(n).copied().filter(|&c| c != u32::MAX);
@@ -1128,7 +1145,7 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
 
     #[inline(always)]
     fn category_of(&self, d: &'a [u8], f: Fd) -> u32 {
-        let s = &d[f.s..f.e];
+        let s = fld(d, f);
         if !self.prod_arr.is_empty() {
             if let Some(n) = product_number(s) {
                 return match self.prod_arr.get(n) {
