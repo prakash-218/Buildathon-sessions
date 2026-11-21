@@ -366,6 +366,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     if cat.ncat > 255 {
         return false;
     }
+    log(t0, "catalog");
     let ncamp = cat.ncamp;
     let organic = ncamp;
     let target = chunk_target(inp, threads);
@@ -391,6 +392,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         .collect();
     let sampled_bytes: usize = ev_chunks.iter().step_by(step).map(|c| head(c, 48 << 10).len()).sum();
     let ev_sample: Vec<(Option<u64>, Option<u64>)> = samples.into_iter().flatten().collect();
+    log(t0, &format!("sampled {} event rows", ev_sample.len()));
     let rows_est = if ev_sample.is_empty() { ev_bytes / 40 } else { ev_bytes / (sampled_bytes / ev_sample.len()).max(1) };
     let pmax = ((rows_est / 24 + 4096) as u64).min(1 << 22);
     let imax = (rows_est + rows_est / 8 + 4096) as u64;
@@ -428,6 +430,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         ok as f64 / users.len().max(1) as f64
     };
     let ukey = solve_key(&link_pairs, 8, user_score).filter(|&(_, s)| s >= 0.9).map(|(k, _)| k);
+    log(t0, "user key");
     let ekey = ukey.and_then(|uk| {
         // Two events of one ordinary person have numbers less than their event
         // count apart. People seen more than 4 times in the sample are skipped:
@@ -511,25 +514,38 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     // (all < 32, all in one root that is not complex), or P_COMPLEX (whose
     // linked aliases are then in cmap).
     let mut pinfo = vec![P_NONE; pmax as usize];
-    let mut cmap: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut k = 0;
-    while k < nodes.len() {
-        let p = nodes[k].0 >> 9;
-        let mut r = k + 1;
-        while r < nodes.len() && nodes[r].0 >> 9 == p {
-            r += 1;
-        }
-        let root = nodes[k].1;
-        let simple = nodes[k..r].iter().all(|&(v, rt)| rt == root && (v & 511) < 32) && !cx[root as usize].load(Relaxed);
-        if simple {
-            let mask = nodes[k..r].iter().fold(0u64, |m, &(v, _)| m | 1 << (v & 511));
-            pinfo[p as usize] = (root as u64) << 32 | mask;
-        } else {
-            pinfo[p as usize] = P_COMPLEX;
-            cmap.extend(nodes[k..r].iter().copied());
-        }
-        k = r;
-    }
+    let pspan = (pmax as usize).div_ceil(threads * 8).max(1);
+    let cmaps: Vec<Vec<(u32, u32)>> = pinfo
+        .par_chunks_mut(pspan)
+        .enumerate()
+        .map(|(t, chunk)| {
+            let lo = (t * pspan) as u32;
+            let mut cm = Vec::new();
+            let start = nodes.partition_point(|n| n.0 >> 9 < lo);
+            let end = nodes.partition_point(|n| ((n.0 >> 9) as usize) < t * pspan + chunk.len());
+            let nodes = &nodes[start..end];
+            let mut k = 0;
+            while k < nodes.len() {
+                let p = nodes[k].0 >> 9;
+                let mut r = k + 1;
+                while r < nodes.len() && nodes[r].0 >> 9 == p {
+                    r += 1;
+                }
+                let root = nodes[k].1;
+                let simple =
+                    nodes[k..r].iter().all(|&(v, rt)| rt == root && (v & 511) < 32) && !cx[root as usize].load(Relaxed);
+                chunk[(p - lo) as usize] = if simple {
+                    (root as u64) << 32 | nodes[k..r].iter().fold(0u64, |m, &(v, _)| m | 1 << (v & 511))
+                } else {
+                    cm.extend_from_slice(&nodes[k..r]);
+                    P_COMPLEX
+                };
+                k = r;
+            }
+            cm
+        })
+        .collect();
+    let cmap: FxHashMap<u32, u32> = cmaps.into_iter().flatten().collect();
     drop(nodes);
     log(t0, &format!("links: {nid} ids, {} other, {} in complex people", omap.len(), cmap.len()));
 
@@ -537,7 +553,12 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     const ING_BASE_OFF: i64 = 1 << 31;
     let ing_base = ws.div_euclid(1000) - ING_BASE_OFF;
     let bad = AtomicBool::new(false);
-    let cap = (rows_est / nsh / threads) * 9 / 8 + 64;
+    // A full shard holds 2^SH events plus their extra copies (a few percent);
+    // each thread gets about its share of them. Unused room is never touched.
+    let cap = {
+        let m = (1usize << SH) * 9 / 8 / threads;
+        m + 4 * (m as f64).sqrt() as usize + 64
+    };
     struct EvOut {
         shards: Vec<Vec<ERec>>,
         odd: Vec<OddEv>,

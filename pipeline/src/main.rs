@@ -999,37 +999,55 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
     /// None if some product or campaign ID does not fit K.
     fn load(inp: &Inputs<'a>) -> Option<Self> {
         let mut ok = true;
-        let mut prod_rows: Vec<(K, &[u8])> = Vec::new();
+        // One pass: each product's category as a number in first-seen order;
+        // canonical `p<digits>` IDs by number, any other ID by key.
         let pb = inp.products;
-        scan::<2, _>(pb, true, |fl| match K::make(pb, fl[0].s, fl[0].e) {
-            Some(k) => prod_rows.push((k, &pb[fl[1].s..fl[1].e])),
-            None => ok = false,
+        let mut seen: Vec<&[u8]> = Vec::new();
+        let mut seen_idx: FxHashMap<&[u8], u32> = FxHashMap::default();
+        let mut by_num: Vec<(usize, u32)> = Vec::new();
+        let mut by_key: Vec<(K, u32)> = Vec::new();
+        scan::<2, _>(pb, true, |fl| {
+            let c = &pb[fl[1].s..fl[1].e];
+            let ci = *seen_idx.entry(c).or_insert_with(|| {
+                seen.push(c);
+                (seen.len() - 1) as u32
+            });
+            match product_number(&pb[fl[0].s..fl[0].e]) {
+                Some(n) => by_num.push((n, ci)),
+                None => match K::make(pb, fl[0].s, fl[0].e) {
+                    Some(k) => by_key.push((k, ci)),
+                    None => ok = false,
+                },
+            }
         });
-        let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
+        let mut cat_names: Vec<&[u8]> = seen.clone();
         cat_names.push(b"unknown");
         cat_names.sort_unstable();
         cat_names.dedup();
-        let cat_rank: FxHashMap<&[u8], u32> = cat_names.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
-        let unknown = cat_rank[&b"unknown"[..]];
-        let products: FxHashMap<K, u32> = prod_rows.iter().map(|r| (r.0, cat_rank[r.1])).collect();
+        let rank_of = |c: &[u8]| cat_names.binary_search(&c).unwrap() as u32;
+        let rank: Vec<u32> = seen.iter().map(|c| rank_of(c)).collect();
+        let unknown = rank_of(b"unknown");
         let ncat = cat_names.len();
-        // An event's product field in canonical `p<digits>` form is looked up in the
-        // array and only there; any other form falls back to the map, which holds
-        // every product.
+        // An event's product field in canonical form is looked up in the array and
+        // only there; any other form in the map (products.csv's other IDs). With
+        // numbers too large for an array, the canonical ones go in the map too.
+        let max = by_num.iter().map(|r| r.0).max().unwrap_or(0);
         let mut prod_arr: Vec<u32> = Vec::new();
-        {
-            let mut raw = Vec::new();
-            scan::<2, _>(pb, true, |fl| raw.push((product_number(&pb[fl[0].s..fl[0].e]), &pb[fl[1].s..fl[1].e])));
-            let max = raw.iter().filter_map(|r| r.0).max().unwrap_or(0);
-            if max < (1 << 20) {
-                prod_arr = vec![u32::MAX; max + 1];
-                for (n, c) in raw {
-                    if let Some(n) = n {
-                        prod_arr[n] = cat_rank[c];
-                    }
+        if max < (1 << 20) {
+            prod_arr = vec![u32::MAX; max + 1];
+            for &(n, ci) in &by_num {
+                prod_arr[n] = rank[ci as usize];
+            }
+        } else {
+            for &(n, ci) in &by_num {
+                let id = format!("p{n}").into_bytes().leak();
+                match K::make(id, 0, id.len()) {
+                    Some(k) => by_key.push((k, ci)),
+                    None => ok = false,
                 }
             }
         }
+        let products: FxHashMap<K, u32> = by_key.iter().map(|&(k, ci)| (k, rank[ci as usize])).collect();
         let mut camp_rows: Vec<(K, &[u8], &[u8])> = Vec::new();
         let cb = inp.campaigns;
         scan::<2, _>(cb, true, |fl| match K::make(cb, fl[0].s, fl[0].e) {
@@ -1203,25 +1221,35 @@ fn link_components<'a, K: Key<'a>>(inp: &Inputs<'a>, target: usize, threads: usi
     drop(idx_pairs);
     let roots: Vec<u32> = (0..nid as u32).into_par_iter().map(|i| find(&parent, i)).collect();
     drop(parent);
-    // Each person's name: the byte-wise smallest of its IDs. Each thread owns a
-    // range of root indices and scans every ID, keeping the ones in its range.
+    // Each person's name: the byte-wise smallest of its IDs. Every ID goes to the
+    // bucket of its root's range, then each range is finished on its own.
     let mut name: Vec<Option<K>> = vec![None; nid];
-    let span = nid.div_ceil(threads * 4).max(1);
-    name.par_chunks_mut(span).enumerate().for_each(|(t, chunk)| {
-        let lo = t * span;
-        for (s, (keys, _)) in id_shards.iter().enumerate() {
+    let nbk = threads * 4;
+    let span = nid.div_ceil(nbk).max(1);
+    let buckets: Vec<Vec<Vec<(u32, K)>>> = id_shards
+        .par_iter()
+        .enumerate()
+        .map(|(s, (keys, _))| {
+            let mut b: Vec<Vec<(u32, K)>> = (0..nbk).map(|_| Vec::new()).collect();
             let rs = &roots[base[s] as usize..base[s] as usize + keys.len()];
             for (&k, &r) in keys.iter().zip(rs) {
-                let r = r as usize;
-                if r >= lo && r < lo + chunk.len() {
-                    let slot = &mut chunk[r - lo];
-                    if slot.is_none_or(|nm| k < nm) {
-                        *slot = Some(k);
-                    }
+                b[r as usize / span].push((r, k));
+            }
+            b
+        })
+        .collect();
+    name.par_chunks_mut(span).enumerate().for_each(|(t, chunk)| {
+        let lo = t * span;
+        for b in &buckets {
+            for &(r, k) in &b[t] {
+                let slot = &mut chunk[r as usize - lo];
+                if slot.is_none_or(|nm| k < nm) {
+                    *slot = Some(k);
                 }
             }
         }
     });
+    drop(buckets);
     let keys = id_shards.into_iter().map(|(k, _)| k).collect();
     Some(Comps { keys, base, roots, name })
 }
