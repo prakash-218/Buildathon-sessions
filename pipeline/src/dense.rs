@@ -1266,17 +1266,22 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     let mut cx_clicks: Vec<Vec<Vec<CRec<u64>>>> = accs.iter_mut().map(|a| std::mem::take(&mut a.cx_cl)).collect();
     cx_clicks.extend(cl_out.into_iter().map(|o| o.cx));
     let n_cx: usize = cx_pays.iter().flat_map(|v| v.iter().map(|x| x.len())).sum();
-    let results: Vec<(Vec<URow<u64>>, Vec<[i64; 4]>)> = (0..NB)
-        .into_par_iter()
-        .fold(
-            || (Vec::new(), vec![[0i64; 4]; size], Scratch::<u64>::default()),
-            |(mut urows, mut camp, mut sc), p| {
-                process_shard(p, &cx_pays, &cx_clicks, day0, ndays, cat.ncat, organic, &mut urows, &mut camp, &mut sc);
-                (urows, camp, sc)
-            },
-        )
-        .map(|(u, c, _)| (u, c))
-        .collect();
+    // One accumulator per thread (a fold would make one per work split, each
+    // with its own campaign table to zero and then sum on one thread).
+    // Biggest shards first, so a whale's shard does not finish last.
+    let mut order: Vec<usize> = (0..NB).collect();
+    order.sort_unstable_by_key(|&p| std::cmp::Reverse(cx_pays.iter().map(|v| v[p].len()).sum::<usize>()));
+    let results: Vec<(Vec<URow<u64>>, Vec<[i64; 4]>)> = per_thread(
+        NB,
+        threads,
+        |_| (Vec::new(), vec![[0i64; 4]; size], Scratch::<u64>::default()),
+        |(urows, camp, sc), i| {
+            process_shard(order[i], &cx_pays, &cx_clicks, day0, ndays, cat.ncat, organic, urows, camp, sc);
+        },
+    )
+    .into_iter()
+    .map(|(u, c, _)| (u, c))
+    .collect();
     phase(t0, 8, &format!("general people done: {n_cx} events"));
 
     // ---- Write.
@@ -1320,9 +1325,16 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         || write_campaign(&cd.join("part-00000.parquet"), &camp_tot, &camp_names, ncamp, ndays, day0),
     );
     log(t0, &format!("wrote {nrows} user rows in {} files", groups.len()));
-    let regions: Vec<(usize, usize)> =
-        inp.events.iter().chain(&inp.clicks).chain(&inp.links).map(|b| (b.as_ptr() as usize, b.len())).collect();
-    regions.par_iter().with_min_len(64).for_each(|&(p, len)| release(p, len));
+    // Hand the input mappings back on all threads, in pieces of at most 64 MB.
+    const PIECE: usize = 64 << 20;
+    let regions: Vec<(usize, usize)> = inp
+        .events
+        .iter()
+        .chain(&inp.clicks)
+        .chain(&inp.links)
+        .flat_map(|b| (0..b.len()).step_by(PIECE).map(move |o| (b.as_ptr() as usize + o, PIECE.min(b.len() - o))))
+        .collect();
+    regions.par_iter().for_each(|&(p, len)| release(p, len));
     log(t0, "done");
     std::process::exit(0);
 }
