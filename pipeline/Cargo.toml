@@ -10,7 +10,6 @@ libc = "0.2"
 memchr = "2"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "55", default-features = false }
 rayon = "1"
 rustc-hash = "2"
 

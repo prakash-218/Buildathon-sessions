@@ -24,18 +24,14 @@ use memmap2::{Advice, Mmap};
 // zero fresh pages: 497k page faults per 20M-event run with glibc, 16k with this.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesPtr};
-use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
-use parquet::schema::parser::parse_message_type;
+mod pq;
+use pq::{Column, GROUP_ROWS, Kind};
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::hash::{BuildHasher, Hash};
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 
@@ -1160,19 +1156,28 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     // The outputs are written and closed. Hand the big buffers and the input
     // mappings back on all threads, then exit: the kernel's own teardown at exit
     // is single-threaded, and with gigabytes mapped it is a visible cost.
+    // RELEASE=all|inputs|none picks what to hand back. "inputs" (the input file
+    // mappings, plain 4 KB pages) measured best: the payload buffers sit in 2 MB
+    // huge pages, and DONTNEED on small ranges inside them splits those pages,
+    // which costs more than the exit teardown it saves.
+    let mode = std::env::var("RELEASE").unwrap_or_else(|_| "inputs".into());
     let mut regions: Vec<(usize, usize)> = Vec::new();
-    for c in pays.iter() {
-        for v in c {
-            regions.push((v.as_ptr() as usize, std::mem::size_of_val(&v[..])));
+    if mode == "all" {
+        for c in pays.iter() {
+            for v in c {
+                regions.push((v.as_ptr() as usize, std::mem::size_of_val(&v[..])));
+            }
+        }
+        for c in clicks.iter() {
+            for v in c {
+                regions.push((v.as_ptr() as usize, std::mem::size_of_val(&v[..])));
+            }
         }
     }
-    for c in clicks.iter() {
-        for v in c {
-            regions.push((v.as_ptr() as usize, std::mem::size_of_val(&v[..])));
+    if mode != "none" {
+        for b in inp.events.iter().chain(&inp.clicks).chain(&inp.links) {
+            regions.push((b.as_ptr() as usize, b.len()));
         }
-    }
-    for b in inp.events.iter().chain(&inp.clicks).chain(&inp.links) {
-        regions.push((b.as_ptr() as usize, b.len()));
     }
     regions.par_iter().with_min_len(64).for_each(|&(p, len)| release(p, len));
     log(t0, "done");
@@ -1468,79 +1473,57 @@ fn process_shard<'a, K: Key<'a>>(
 
 // ------------------------------------------------------------------ Parquet
 
-fn put<T: DataType, W: Write + Send>(rg: &mut SerializedRowGroupWriter<'_, W>, vals: &[T::T], def: Option<&[i16]>) {
-    let mut col = rg.next_column().expect("next column").expect("column exists");
-    col.typed::<T>().write_batch(vals, def, None).expect("write column");
-    col.close().expect("close column");
-}
-
-/// No dictionaries or statistics: user IDs are all distinct, and nothing reads the stats.
-fn props() -> WriterPropertiesPtr {
-    Arc::new(
-        WriterProperties::builder()
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .build(),
-    )
-}
-
-fn bytes(v: &[u8]) -> ByteArray {
-    ByteArray::from(v.to_vec())
+/// Columns for one row group of `n` rows, with room reserved for `n` values.
+fn columns(k: usize) -> Vec<Column> {
+    (0..k).map(|_| Column::new()).collect()
 }
 
 fn write_user<'a, K: Key<'a>>(path: &Path, parts: &[&[URow<K>]], cat_names: &[&[u8]]) {
-    let rows: Vec<&URow<K>> = parts.iter().flat_map(|p| p.iter()).collect();
-    let schema = parse_message_type(
-        "message user_daily {
-            REQUIRED BYTE_ARRAY user_id (STRING);
-            REQUIRED INT32 day (DATE);
-            REQUIRED INT64 sessions;
-            REQUIRED INT64 events;
-            REQUIRED INT64 revenue_cents;
-            OPTIONAL BYTE_ARRAY top_category (STRING);
-        }",
-    )
-    .unwrap();
-    let file = BufWriter::with_capacity(1 << 20, File::create(path).expect("create parquet"));
-    let mut w = SerializedFileWriter::new(file, Arc::new(schema), props()).unwrap();
-    if !rows.is_empty() {
-        let mut rg = w.next_row_group().unwrap();
-        let names: Vec<ByteArray> = rows
-            .iter()
-            .map(|r| {
-                let mut b = Vec::with_capacity(16);
-                r.name.put(&mut b);
-                ByteArray::from(b)
-            })
-            .collect();
-        put::<ByteArrayType, _>(&mut rg, &names, None);
-        put::<Int32Type, _>(&mut rg, &rows.iter().map(|r| r.day).collect::<Vec<_>>(), None);
-        put::<Int64Type, _>(&mut rg, &rows.iter().map(|r| r.sessions).collect::<Vec<_>>(), None);
-        put::<Int64Type, _>(&mut rg, &rows.iter().map(|r| r.events).collect::<Vec<_>>(), None);
-        put::<Int64Type, _>(&mut rg, &rows.iter().map(|r| r.revenue).collect::<Vec<_>>(), None);
-        let defs: Vec<i16> = rows.iter().map(|r| r.top.is_some() as i16).collect();
-        let tops: Vec<ByteArray> = rows.iter().filter_map(|r| r.top).map(|c| bytes(cat_names[c as usize])).collect();
-        put::<ByteArrayType, _>(&mut rg, &tops, Some(&defs));
-        rg.close().unwrap();
+    let schema = [
+        ("user_id", Kind::Str),
+        ("day", Kind::Date),
+        ("sessions", Kind::I64),
+        ("events", Kind::I64),
+        ("revenue_cents", Kind::I64),
+        ("top_category", Kind::OptStr),
+    ];
+    let (mut groups, mut rows) = (Vec::new(), Vec::new());
+    let mut cols = columns(schema.len());
+    let mut n = 0usize;
+    for r in parts.iter().flat_map(|p| p.iter()) {
+        cols[0].bytes_with(|b| r.name.put(b));
+        cols[1].i32(r.day);
+        cols[2].i64(r.sessions);
+        cols[3].i64(r.events);
+        cols[4].i64(r.revenue);
+        cols[5].opt_bytes(r.top.map(|c| cat_names[c as usize]));
+        n += 1;
+        if n == GROUP_ROWS {
+            groups.push(std::mem::replace(&mut cols, columns(schema.len())));
+            rows.push(n);
+            n = 0;
+        }
     }
-    w.close().unwrap();
+    if n > 0 {
+        groups.push(cols);
+        rows.push(n);
+    }
+    pq::write(path, &schema, &groups, &rows).expect("write user_daily parquet");
 }
 
 fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_names: &[(&[u8], &[u8])], ncamp: usize, ndays: usize, day0: i64) {
-    let schema = parse_message_type(
-        "message campaign_daily {
-            REQUIRED BYTE_ARRAY campaign_id (STRING);
-            REQUIRED BYTE_ARRAY channel (STRING);
-            REQUIRED INT32 day (DATE);
-            REQUIRED INT64 sessions;
-            REQUIRED INT64 purchasing_sessions;
-            REQUIRED INT64 revenue_cents;
-            REQUIRED INT64 assisted_sessions;
-        }",
-    )
-    .unwrap();
-    let (mut ids, mut chans, mut days) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut s, mut ps, mut rev, mut asst) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let schema = [
+        ("campaign_id", Kind::Str),
+        ("channel", Kind::Str),
+        ("day", Kind::Date),
+        ("sessions", Kind::I64),
+        ("purchasing_sessions", Kind::I64),
+        ("revenue_cents", Kind::I64),
+        ("assisted_sessions", Kind::I64),
+    ];
+    let (mut groups, mut rows) = (Vec::new(), Vec::new());
+    let mut cols = columns(schema.len());
+    let mut n = 0usize;
     for c in 0..=ncamp {
         for d in 0..ndays {
             let t = tot[c * ndays + d];
@@ -1548,29 +1531,25 @@ fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_names: &[(&[u8], &[u8])], 
                 continue;
             }
             let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { camp_names[c] };
-            ids.push(bytes(id));
-            chans.push(bytes(ch));
-            days.push((day0 + d as i64) as i32);
-            s.push(t[0]);
-            ps.push(t[1]);
-            rev.push(t[2]);
-            asst.push(t[3]);
+            cols[0].bytes(id);
+            cols[1].bytes(ch);
+            cols[2].i32((day0 + d as i64) as i32);
+            for (k, v) in t.iter().enumerate() {
+                cols[3 + k].i64(*v);
+            }
+            n += 1;
+            if n == GROUP_ROWS {
+                groups.push(std::mem::replace(&mut cols, columns(schema.len())));
+                rows.push(n);
+                n = 0;
+            }
         }
     }
-    let file = BufWriter::new(File::create(path).expect("create parquet"));
-    let mut w = SerializedFileWriter::new(file, Arc::new(schema), props()).unwrap();
-    if !ids.is_empty() {
-        let mut rg = w.next_row_group().unwrap();
-        put::<ByteArrayType, _>(&mut rg, &ids, None);
-        put::<ByteArrayType, _>(&mut rg, &chans, None);
-        put::<Int32Type, _>(&mut rg, &days, None);
-        put::<Int64Type, _>(&mut rg, &s, None);
-        put::<Int64Type, _>(&mut rg, &ps, None);
-        put::<Int64Type, _>(&mut rg, &rev, None);
-        put::<Int64Type, _>(&mut rg, &asst, None);
-        rg.close().unwrap();
+    if n > 0 {
+        groups.push(cols);
+        rows.push(n);
     }
-    w.close().unwrap();
+    pq::write(path, &schema, &groups, &rows).expect("write campaign_daily parquet");
 }
 
 #[cfg(test)]
