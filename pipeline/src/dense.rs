@@ -25,6 +25,15 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+/// STOP=n exits after the n-th phase log (for counting each phase's instructions).
+fn phase(t0: Instant, n: u32, what: &str) {
+    log(t0, what);
+    static STOP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if *STOP.get_or_init(|| std::env::var("STOP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) == n {
+        std::process::exit(0);
+    }
+}
+
 // ------------------------------------------------------------ the scramble
 
 const MASK: u64 = (1 << 40) - 1;
@@ -295,6 +304,62 @@ const HOME_MULTI: u32 = u32::MAX - 1;
 const P_NONE: u64 = 0;
 const P_COMPLEX: u64 = u64::MAX;
 
+/// The 7 fields of the event line starting at `ls`, split in one go: four
+/// 32-byte loads give its newline, comma and quote masks as 128-bit integers;
+/// the first newline ends it; it is well formed iff 6 commas come before it and
+/// its quotes all wrap whole fields. Returns (fields, or None for a malformed
+/// line; where the next line starts), or None (use the slow path) for a line of
+/// 128 bytes or more, or one too near the end of `d`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn event_line(d: &[u8], ls: usize) -> Option<(Option<[Fd; 7]>, usize)> {
+    use std::arch::x86_64::*;
+    if ls + 128 > d.len() {
+        return None;
+    }
+    // SAFETY: ls + 128 <= d.len(), so the four loads stay inside d.
+    let (nl, cm, qt) = unsafe {
+        let p = d.as_ptr().add(ls) as *const __m256i;
+        let v = [_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)), _mm256_loadu_si256(p.add(2)), _mm256_loadu_si256(p.add(3))];
+        let mask = |c: u8| -> u128 {
+            let x = _mm256_set1_epi8(c as i8);
+            let m = |i: usize| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v[i], x)) as u32 as u128;
+            m(0) | m(1) << 32 | m(2) << 64 | m(3) << 96
+        };
+        (mask(b'\n'), mask(b','), mask(b'"'))
+    };
+    if nl == 0 {
+        return None;
+    }
+    let e = nl.trailing_zeros();
+    let next = ls + e as usize + 1;
+    let below = (1u128 << e) - 1;
+    let mut m = cm & below;
+    if m.count_ones() != 6 {
+        return Some((None, next));
+    }
+    let mut fl = [Fd::default(); 7];
+    let mut s = ls;
+    for x in fl.iter_mut().take(6) {
+        let p = ls + m.trailing_zeros() as usize;
+        m &= m - 1;
+        *x = Fd { s, e: p };
+        s = p + 1;
+    }
+    fl[6] = Fd { s, e: ls + e as usize };
+    let quotes = (qt & below).count_ones() as u64;
+    if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
+        return Some((None, next));
+    }
+    Some((Some(fl), next))
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn event_line(_d: &[u8], _ls: usize) -> Option<(Option<[Fd; 7]>, usize)> {
+    None
+}
+
 enum Uid {
     Norm(u32),
     Other(u64),
@@ -366,7 +431,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     if cat.ncat > 255 {
         return false;
     }
-    log(t0, "catalog");
+    phase(t0, 1, "catalog");
     let ncamp = cat.ncamp;
     let organic = ncamp;
     let target = chunk_target(inp, threads);
@@ -458,7 +523,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         let score = |k: u64| es.iter().filter(|&&y| unscramble(y, k) < imax).count() as f64 / es.len().max(1) as f64;
         solve_key(&pairs, 64, score).filter(|&(_, s)| s >= 0.9).map(|(k, _)| k)
     });
-    log(t0, &format!("keys: user {ukey:?}, event {ekey:?}; ~{rows_est} event rows, {nsh} shards"));
+    phase(t0, 2, &format!("keys: user {ukey:?}, event {ekey:?}; ~{rows_est} event rows, {nsh} shards"));
     if (ukey.is_none() || ekey.is_none()) && !force {
         return false;
     }
@@ -547,7 +612,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         .collect();
     let cmap: FxHashMap<u32, u32> = cmaps.into_iter().flatten().collect();
     drop(nodes);
-    log(t0, &format!("links: {nid} ids, {} other, {} in complex people", omap.len(), cmap.len()));
+    phase(t0, 3, &format!("links: {nid} ids, {} other, {} in complex people", omap.len(), cmap.len()));
 
     // ---- Events: every copy, into its number's shard.
     const ING_BASE_OFF: i64 = 1 << 31;
@@ -564,6 +629,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         odd: Vec<OddEv>,
         ousers: Vec<u64>,
     }
+    let pop = std::env::var("POP").map(|v| v != "0").unwrap_or(true);
     let ev_out: Vec<EvOut> = per_thread(
         ev_chunks.len(),
         threads,
@@ -571,7 +637,10 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         |st, ci| {
             let c = ev_chunks[ci];
             let d = c.data;
-            scan::<7, _>(d, c.skip_first, |fl| {
+            if pop {
+                populate(d);
+            }
+            let mut row = |fl: &[Fd; 7]| {
                 if fl[0].empty() {
                     return;
                 }
@@ -634,7 +703,24 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                         None => bad.store(true, Relaxed),
                     },
                 }
-            });
+            };
+            // Line by line: an ordinary line is split in one go (event_line);
+            // anything else, byte by byte.
+            let mut ls = if c.skip_first { memchr(b'\n', d).map_or(d.len(), |i| i + 1) } else { 0 };
+            while ls < d.len() {
+                let (fl, next) = match event_line(d, ls) {
+                    Some(x) => x,
+                    None => {
+                        let e = memchr(b'\n', &d[ls..]).map_or(d.len(), |i| ls + i);
+                        let mut fl = [Fd::default(); 7];
+                        (slow_line(d, ls, e, &mut fl).then_some(fl), e + 1)
+                    }
+                };
+                ls = next;
+                if let Some(fl) = fl {
+                    row(&fl);
+                }
+            }
         },
     );
     if bad.load(Relaxed) {
@@ -666,7 +752,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         let t = ((u & !O_FLAG) >> O_SHIFT) as usize;
         ev_out[t].ousers[(u & ((1 << O_SHIFT) - 1)) as usize]
     };
-    log(t0, "events parsed");
+    phase(t0, 4, "events parsed");
 
     // ---- Which people can be finished in one shard. home[p] is the shard of
     // p's surviving events, HOME_MULTI if they are in several (or not in one
@@ -765,7 +851,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         }
     }
     let n_surv: usize = survivors.iter().map(|s| s.len()).sum();
-    log(t0, &format!("events deduped: {n_surv} + {} odd survive", odd_surv.len()));
+    phase(t0, 5, &format!("events deduped: {n_surv} + {} odd survive", odd_surv.len()));
 
     // The person key of a dense user (after links): root | 1 << 63, or the user itself.
     let pk_of = |v: u32| -> u64 {
@@ -803,6 +889,23 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         |st, ci| {
             let c = cl_chunks[ci];
             let d = c.data;
+            // A click of a dense user waits AHEAD rows in this ring while its
+            // person's entries are prefetched; then `route` sends it on.
+            let mut ring = [CLoc { id: 0, ts: 0, user: 0, camp: 0 }; AHEAD];
+            let (mut head, mut queued) = (0usize, 0usize);
+            let route = |st: &mut ClOut, c: &CLoc| {
+                let p = (c.user >> 9) as usize;
+                let h = home[p].load(Relaxed);
+                let pk = pk_of(c.user);
+                if pinfo[p] != P_COMPLEX && h != HOME_MULTI && !pk_cx(pk) {
+                    if h != HOME_NONE {
+                        st.shards[h as usize].push(*c);
+                    }
+                    return; // HOME_NONE: this person has no session
+                }
+                let name = pk_name(pk);
+                st.cx[shard_of(&name)].push(CRec { name, id: c.id, ts: cl_base + c.ts as i64, camp: c.camp });
+            };
             scan::<4, _>(d, c.skip_first, |fl| {
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
@@ -818,30 +921,37 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     bad.store(true, Relaxed);
                     return;
                 };
-                let name = match u {
+                match u {
                     Uid::Norm(v) => {
-                        let p = v >> 9;
-                        let h = home[p as usize].load(Relaxed);
-                        let pk = pk_of(v);
-                        if pinfo[p as usize] != P_COMPLEX && h != HOME_MULTI && !pk_cx(pk) {
-                            if h != HOME_NONE {
-                                st.shards[h as usize].push(CLoc { id, ts: (ts - cl_base) as u32, user: v, camp });
-                            }
-                            return; // HOME_NONE: this person has no session
+                        let p = (v >> 9) as usize;
+                        prefetch(&home[p]);
+                        prefetch(&pinfo[p]);
+                        let e = CLoc { id, ts: (ts - cl_base) as u32, user: v, camp };
+                        if queued == AHEAD {
+                            route(st, &ring[head]);
+                            ring[head] = e;
+                            head = (head + 1) % AHEAD;
+                        } else {
+                            ring[(head + queued) % AHEAD] = e;
+                            queued += 1;
                         }
-                        pk_name(pk)
                     }
-                    Uid::Other(k) => other_name(k),
-                };
-                st.cx[shard_of(&name)].push(CRec { name, id, ts, camp });
+                    Uid::Other(k) => {
+                        let name = other_name(k);
+                        st.cx[shard_of(&name)].push(CRec { name, id, ts, camp });
+                    }
+                }
             });
+            for k in 0..queued {
+                route(st, &ring[(head + k) % AHEAD]);
+            }
         },
     );
     if bad.load(Relaxed) {
         log(t0, "fast path: a click ID it cannot hold; using the main pipeline");
         return false;
     }
-    log(t0, "clicks parsed");
+    phase(t0, 6, "clicks parsed");
 
     // ---- Pass 2, per shard: finish every person who is entirely here; send
     // the rest to the general path.
@@ -855,6 +965,8 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         cx_ev: Vec<Vec<PRec<u64>>>,
         cx_cl: Vec<Vec<CRec<u64>>>,
         cls: Vec<CLoc>,
+        coff: Vec<u32>,
+        cur: Vec<u32>,
         tev: Vec<(u64, Ev)>,
         tcl: Vec<(u64, Cl<u64>)>,
         ev: Vec<Ev>,
@@ -867,6 +979,8 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         cx_ev: (0..NB).map(|_| Vec::new()).collect(),
         cx_cl: (0..NB).map(|_| Vec::new()).collect(),
         cls: Vec::new(),
+        coff: Vec::new(),
+        cur: Vec::new(),
         tev: Vec::new(),
         tcl: Vec::new(),
         ev: Vec::new(),
@@ -879,11 +993,59 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     };
     let mut accs: Vec<Acc> = per_thread(nsh, threads, |_| new_acc(), |acc, q| {
             acc.ps.reset(cat.ncat);
-            acc.cls.clear();
+            // This shard's clicks, grouped by person: a counting sort over the
+            // shard's range of people (a plain sort if that range is sparse).
+            let n_cl: usize = cl_out.iter().map(|o| o.shards[q].len()).sum();
+            let (mut pmin, mut pmax) = (u32::MAX, 0u32);
             for o in &cl_out {
-                acc.cls.extend_from_slice(&o.shards[q]);
+                for c in &o.shards[q] {
+                    pmin = pmin.min(c.user >> 9);
+                    pmax = pmax.max(c.user >> 9);
+                }
             }
-            acc.cls.sort_unstable_by_key(|c| c.user);
+            acc.cls.clear();
+            acc.coff.clear();
+            let counted = n_cl > 0 && ((pmax - pmin) as usize) < 4 * n_cl + 4096;
+            if counted {
+                let span = (pmax - pmin) as usize + 1;
+                acc.coff.resize(span + 1, 0);
+                for o in &cl_out {
+                    for c in &o.shards[q] {
+                        acc.coff[(c.user >> 9) as usize - pmin as usize + 1] += 1;
+                    }
+                }
+                for i in 0..span {
+                    acc.coff[i + 1] += acc.coff[i];
+                }
+                acc.cls.resize(n_cl, CLoc { id: 0, ts: 0, user: 0, camp: 0 });
+                let Acc { cls, coff, cur, .. } = &mut *acc;
+                cur.clear();
+                cur.extend_from_slice(&coff[..span]);
+                for o in &cl_out {
+                    for c in &o.shards[q] {
+                        let b = (c.user >> 9) as usize - pmin as usize;
+                        cls[cur[b] as usize] = *c;
+                        cur[b] += 1;
+                    }
+                }
+            } else {
+                for o in &cl_out {
+                    acc.cls.extend_from_slice(&o.shards[q]);
+                }
+                acc.cls.sort_unstable_by_key(|c| c.user);
+            }
+            let clicks_of = |cls: &[CLoc], coff: &[u32], p: u32| -> (usize, usize) {
+                if counted {
+                    if p < pmin || p > pmax {
+                        (0, 0)
+                    } else {
+                        let b = (p - pmin) as usize;
+                        (coff[b] as usize, coff[b + 1] as usize)
+                    }
+                } else {
+                    (cls.partition_point(|c| c.user >> 9 < p), cls.partition_point(|c| c.user >> 9 <= p))
+                }
+            };
             let surv = &survivors[q];
             let mut k = 0;
             while k < surv.len() {
@@ -908,10 +1070,35 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     }
                     continue;
                 }
-                let c0 = acc.cls.partition_point(|c| c.user >> 9 < p);
-                let c1 = acc.cls.partition_point(|c| c.user >> 9 <= p);
-                // Group this person's events and clicks by person key.
+                let (c0, c1) = clicks_of(&acc.cls, &acc.coff, p);
                 let Acc { tev, tcl, ev, cl, cls, urows, camp, ps, cx_ev, cx_cl, .. } = &mut *acc;
+                // The usual case: one person key for the whole run (every event
+                // from the same ID, or from linked IDs of one simple person).
+                let info = pinfo[p as usize];
+                let pk0 = pk_of(run[0].user);
+                let same = if info == P_NONE {
+                    run.iter().all(|e| e.user == run[0].user)
+                } else {
+                    pk0 >> 63 == 1 && run.iter().all(|e| (e.user & 511) < 32 && info >> (e.user & 511) & 1 == 1)
+                };
+                if same && !pk_cx(pk0) {
+                    ev.clear();
+                    ev.extend(run.iter().map(ev_of));
+                    cl.clear();
+                    for c in &cls[c0..c1] {
+                        let pk = pk_of(c.user);
+                        let x = Cl { ts: cl_base + c.ts as i64, id: c.id, camp: c.camp };
+                        if pk == pk0 {
+                            cl.push(x);
+                        } else if pk_cx(pk) {
+                            let name = pk_name(pk);
+                            cx_cl[shard_of(&name)].push(CRec { name, id: x.id, ts: x.ts, camp: x.camp });
+                        }
+                    }
+                    person(ev, cl, pk_name(pk0), day0, organic, ndays, ps, urows, camp);
+                    continue;
+                }
+                // Otherwise group this person's events and clicks by person key.
                 tev.clear();
                 tcl.clear();
                 for e in run {
@@ -975,7 +1162,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     }
     drop(survivors);
     let n_local: usize = accs.iter().map(|a| a.urows.len()).sum();
-    log(t0, &format!("local people done: {n_local} rows"));
+    phase(t0, 7, &format!("local people done: {n_local} rows"));
 
     // ---- The general path for everyone else: per-name shards, as in the main pipeline.
     let cx_pays: Vec<Vec<Vec<PRec<u64>>>> = accs.iter_mut().map(|a| std::mem::take(&mut a.cx_ev)).collect();
@@ -993,7 +1180,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         )
         .map(|(u, c, _)| (u, c))
         .collect();
-    log(t0, &format!("general people done: {n_cx} events"));
+    phase(t0, 8, &format!("general people done: {n_cx} events"));
 
     // ---- Write.
     let ud = out.join("user_daily");

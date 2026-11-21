@@ -331,13 +331,48 @@ fn bits_between(lo: usize, hi: usize) -> u64 {
 /// dialect: only '\n' ends a line, exactly N fields, quotes only around a whole
 /// field (and nowhere inside it). Malformed and empty lines are skipped, and so
 /// is the first line when `skip_first` (the file's header).
-#[inline(always)]
-#[allow(unused_assignments)] // the macros' resets after the last line
 ///
+/// Strip the quotes of the fields that open with one; false unless they all
+/// close with one and those are all of the line's `quotes`.
+#[inline(always)]
+fn unwrap_quotes<const N: usize>(d: &[u8], fl: &mut [Fd; N], quotes: u64) -> bool {
+    let mut wrapped = 0u64;
+    for x in fl.iter_mut() {
+        if x.e > x.s && d[x.s] == b'"' {
+            if x.e < x.s + 2 || d[x.e - 1] != b'"' {
+                return false; // opens with a quote but does not close with one
+            }
+            *x = Fd { s: x.s + 1, e: x.e - 1 };
+            wrapped += 2;
+        }
+    }
+    wrapped == quotes // else a quote inside a field
+}
+
+/// The line `d[s..e]` (no '\n' in it), byte by byte: its N fields, or false.
+#[inline(never)]
+fn slow_line<const N: usize>(d: &[u8], s: usize, e: usize, fl: &mut [Fd; N]) -> bool {
+    let (mut k, mut fstart, mut quotes) = (0usize, s, 0u64);
+    for pos in s..=e {
+        if pos == e || d[pos] == b',' {
+            if k >= N {
+                return false;
+            }
+            fl[k] = Fd { s: fstart, e: pos };
+            k += 1;
+            fstart = pos + 1;
+        } else if d[pos] == b'"' {
+            quotes += 1;
+        }
+    }
+    k == N && (quotes == 0 || unwrap_quotes(d, fl, quotes))
+}
+
 /// Only commas and newlines are stepped through (a regular pattern the branch
 /// predictor learns); quotes are counted per field with a popcount. A field is
 /// valid with no quote at all, or with exactly two that are its first and last
 /// byte (then nothing between them can be a quote).
+#[inline(always)]
 fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F) {
     let n = d.len();
     // Per line: where its separators are (the first N; more means malformed),
@@ -378,8 +413,11 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
         f(&fl);
     }
 
+    // A last line with no '\n' ends at a virtual one at n, so `line` (and `f`
+    // inside it) has a single call site and is inlined.
+    let virt = if n > 0 && d[n - 1] != b'\n' { n } else { usize::MAX };
     let mut base = 0usize;
-    while base < n {
+    while base < n || base == virt {
         // Ask for the input 1 KB ahead, so the stream arrives before the scanner
         // needs it. A prefetch never faults, so running past the end is harmless.
         #[cfg(target_arch = "x86_64")]
@@ -387,7 +425,10 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             _mm_prefetch::<_MM_HINT_T0>(d.as_ptr().wrapping_add(base + 1024) as *const i8);
         }
-        let (nl, cm, qt) = masks(d, base);
+        let (mut nl, cm, qt) = masks(d, base);
+        if virt.wrapping_sub(base) < 64 {
+            nl |= 1 << (virt - base);
+        }
         let mut s = nl | cm;
         while s != 0 {
             let bit = s.trailing_zeros() as usize;
@@ -407,14 +448,6 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
         }
         qbase += qt.count_ones() as u64;
         base += 64;
-    }
-    if lstart < n {
-        // A last line with no '\n'.
-        seps[k.min(N - 1)] = n;
-        k += 1;
-        if k == N && !skip {
-            line(d, lstart, &seps, qbase - qstart, &mut f);
-        }
     }
 }
 
@@ -936,6 +969,17 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
 
+    // SCANBENCH=1|2: only scan the event files (new scanner | per-separator one), for instruction counts.
+    if let Ok(m) = std::env::var("SCANBENCH") {
+        let maps = map_dir(&data.join("events"));
+        let mut tot = 0usize;
+        for mm in &maps {
+            let cb = |fl: &[Fd; 7]| tot += fl[3].e - fl[0].s;
+            scan::<7, _>(&mm[..], true, cb)
+        }
+        eprintln!("scanbench {m}: {tot}");
+        std::process::exit(0);
+    }
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
     let we = parse_ts(json_str(&manifest, "window_end").as_bytes()).expect("window_end");
@@ -1570,6 +1614,22 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     regions.par_iter().with_min_len(64).for_each(|&(p, len)| release(p, len));
     log(t0, "done");
     std::process::exit(0);
+}
+
+/// Map the pages under `d` (part of a file mapping) into the page table in
+/// one call (MADV_POPULATE_READ, Linux 5.14+; a no-op where unsupported), so
+/// scanning it takes no page faults, and prefetches past a page boundary are
+/// not dropped for want of a mapping.
+fn populate(d: &[u8]) {
+    const PAGE: usize = 4096;
+    const MADV_POPULATE_READ: libc::c_int = 22;
+    let p = d.as_ptr() as usize;
+    let start = p & !(PAGE - 1);
+    if d.is_empty() {
+        return;
+    }
+    // SAFETY: the range covers pages of a live read-only mapping; POPULATE_READ only faults them in.
+    unsafe { libc::madvise(start as *mut libc::c_void, p + d.len() - start, MADV_POPULATE_READ) };
 }
 
 /// madvise(MADV_DONTNEED) the whole pages inside `[p, p + len)`. Only called on
