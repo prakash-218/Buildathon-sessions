@@ -665,6 +665,79 @@ fn ts_at(d: &[u8], f: Fd) -> Option<i64> {
     parse_ts(fld(d, f))
 }
 
+/// An F1 timestamp `d[f]` (20 bytes) -> epoch seconds, in one 32-byte load:
+/// separators and digits checked with one compare, the seven digit pairs
+/// (seconds included) gathered by one shuffle and range-checked together.
+/// None for anything else (then `ts_at` decides). Needs f.s + 32 <= d.len().
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f1_secs(d: &[u8], f: Fd) -> Option<i64> {
+    use std::arch::x86_64::*;
+    if f.e - f.s != 20 || f.s + 32 > d.len() {
+        return None;
+    }
+    // SAFETY: f.s + 32 <= d.len().
+    let (y, mo, dd, h, mi, se) = unsafe {
+        let v = _mm256_loadu_si256(d.as_ptr().add(f.s) as *const __m256i);
+        let dg = _mm256_sub_epi8(v, _mm256_set1_epi8(0x30));
+        let digit = _mm256_cmpeq_epi8(_mm256_min_epu8(dg, _mm256_set1_epi8(9)), dg);
+        let tmpl = _mm256_setr_epi8(
+            0, 0, 0, 0, 45, 0, 0, 45, 0, 0, 84, 0, 0, 58, 0, 0, 58, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ); // - - T : : Z
+        let at_sep = _mm256_setr_epi8(
+            0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let ok = _mm256_blendv_epi8(digit, _mm256_cmpeq_epi8(v, tmpl), at_sep);
+        if (_mm256_movemask_epi8(ok) as u32) & 0xf_ffff != 0xf_ffff {
+            return None;
+        }
+        // Low lane: YY YY MM DD hh mm; high lane: ss (bytes 17 and 18 are its 1 and 2).
+        let sh = _mm256_setr_epi8(
+            0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+        let p = _mm256_maddubs_epi16(_mm256_shuffle_epi8(dg, sh), _mm256_set1_epi16(0x010a));
+        let maxv = _mm256_setr_epi16(99, 99, 12, 31, 23, 59, 0, 0, 59, 0, 0, 0, 0, 0, 0, 0);
+        let minv = _mm256_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        if _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpgt_epi16(p, maxv), _mm256_cmpgt_epi16(minv, p))) != 0 {
+            return None;
+        }
+        let lo = _mm256_castsi256_si128(p);
+        let hi = _mm256_extracti128_si256::<1>(p);
+        (
+            _mm_extract_epi16::<0>(lo) as i64 * 100 + _mm_extract_epi16::<1>(lo) as i64,
+            _mm_extract_epi16::<2>(lo) as i64,
+            _mm_extract_epi16::<3>(lo) as i64,
+            _mm_extract_epi16::<4>(lo) as i64,
+            _mm_extract_epi16::<5>(lo) as i64,
+            _mm_extract_epi16::<0>(hi) as i64,
+        )
+    };
+    if !(TABLE_Y0..TABLE_Y0 + TABLE_YEARS as i64).contains(&y) {
+        return None;
+    }
+    let i = (y - TABLE_Y0) as usize * 12 + mo as usize - 1;
+    let (start, next) = (MONTH_START[i] as i64, MONTH_START[i + 1] as i64);
+    if dd > next - start {
+        return None;
+    }
+    Some((((start + dd - 1) * 24 + h) * 60 + mi) * 60 + se)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn f1_secs(_d: &[u8], _f: Fd) -> Option<i64> {
+    None
+}
+
+/// `ts_at`, with F1 by `f1_secs` first.
+#[inline(always)]
+fn ts_fast(d: &[u8], f: Fd) -> Option<i64> {
+    match f1_secs(d, f) {
+        Some(s) => Some(s * 1000),
+        None => ts_at(d, f),
+    }
+}
+
 /// F1 or F2 (`s` is 20 or 25 bytes) -> epoch ms, or None to let the exact
 /// parser decide (it also reads 20 or 25 digits as F3).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2149,7 +2222,9 @@ mod tests {
             d.extend_from_slice(&s);
             d.extend_from_slice(b",yyyy");
             let f = Fd { s: start, e: start + s.len() };
+            d.extend_from_slice(b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
             assert_eq!(ts_at(&d, f), parse_ts_slow(&s), "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(ts_fast(&d, f), parse_ts_slow(&s), "fast {:?}", String::from_utf8_lossy(&s));
         }
     }
 

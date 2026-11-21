@@ -731,7 +731,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 }
                 // Both IDs decoded together.
                 let (ye, yu) = b36x2(d, fl[0], b'e', fl[1], b'u');
-                let ing_ms = ts_at(d, fl[3]);
+                let ing_ms = ts_fast(d, fl[3]);
                 let ingest = match ing_ms {
                     None => u32::MAX,
                     Some(ms) => {
@@ -748,7 +748,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     if fl[1].empty() || fl[5].empty() {
                         break 'v;
                     }
-                    let Some(t) = ts_at(d, fl[2]) else { break 'v };
+                    let Some(t) = ts_fast(d, fl[2]) else { break 'v };
                     if t < ws || t >= we {
                         break 'v;
                     }
@@ -991,7 +991,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 let Some(camp) = cat.campaign_of(d, fl[2]) else {
                     return;
                 };
-                let Some(ts) = ts_at(d, fl[3]) else { return };
+                let Some(ts) = ts_fast(d, fl[3]) else { return };
                 if ts < cl_base || ts >= we {
                     return;
                 }
