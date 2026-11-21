@@ -43,7 +43,6 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const NB: usize = 256; // shards for both shuffles
-const INVALID: u32 = u32::MAX; // ERec::cat of an event copy that fails validation
 
 // --------------------------------------------------------------------- keys
 
@@ -144,11 +143,35 @@ fn fmix64(mut h: u64) -> u64 {
     h ^ (h >> 33)
 }
 
-/// Shard from a re-mixed hash, so the shard does not correlate with the hash
-/// bits the maps inside each shard use.
+/// A re-mixed hash: the top 8 bits pick the shard, the low 24 the filter bit,
+/// and neither correlates with the bits the maps inside each shard use.
+#[inline(always)]
+fn mix<T: Hash>(k: &T) -> u64 {
+    fmix64(FxBuildHasher.hash_one(k))
+}
+
 #[inline(always)]
 fn shard_of<T: Hash>(k: &T) -> usize {
-    (fmix64(FxBuildHasher.hash_one(k)) >> 56) as usize & (NB - 1)
+    (mix(k) >> 56) as usize & (NB - 1)
+}
+
+const FILTER_BITS: usize = 1 << 24; // 2 MB
+
+/// "Product ID `p<digits>` in canonical form (no leading zero)" -> its number.
+/// Such IDs are looked up in a small array instead of a hash map.
+#[inline(always)]
+fn product_number(s: &[u8]) -> Option<usize> {
+    if s.len() < 2 || s.len() > 7 || s[0] != b'p' || (s.len() > 2 && s[1] == b'0') {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in &s[1..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as usize;
+    }
+    Some(v)
 }
 
 fn new_map<K, V>(cap: usize) -> FxHashMap<K, V> {
@@ -419,25 +442,31 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 // ------------------------------------------------------------------ records
 
-/// One parsed event copy, before dedup. `cat == INVALID` marks a copy that fails validation.
+/// One parsed event copy, for dedup: its ID, its ingest time, and where its
+/// payload is (`NO_LOC` for a copy that fails validation and so has none).
 #[derive(Clone, Copy)]
-struct ERec<K> {
+struct DRec<K> {
     id: K,
-    name: K, // the person
     ingest: i64,
-    ts: i64,
+    loc: u64, // chunk << 40 | person shard << 32 | index in that chunk's shard
+}
+
+const NO_LOC: u64 = u64::MAX;
+const DEAD: i64 = i64::MIN; // PRec::ts of a copy that lost the dedup
+
+/// A valid event copy, written once at parse time into its person's shard.
+#[derive(Clone, Copy)]
+struct PRec<K> {
+    name: K,
+    ts: i64, // DEAD once dedup keeps another copy of the same event
     price: u32, // purchase price, 0 for view/cart
     cat: u32,   // category rank
 }
 
-/// A surviving event, keyed by person.
+/// A raw pointer that may cross threads. Used only to mark dead payloads during
+/// dedup: each payload is owned by one event-id shard, so writes never collide.
 #[derive(Clone, Copy)]
-struct PRec<K> {
-    name: K,
-    ts: i64,
-    price: u32,
-    cat: u32,
-}
+struct SendPtr(usize);
 
 /// A valid click, keyed by person.
 #[derive(Clone, Copy)]
@@ -571,7 +600,6 @@ fn main() {
         log(t0, "using byte-slice keys");
         assert!(run::<&[u8]>(t0, &out, &inp, threads));
     }
-    log(t0, "done");
 }
 
 /// The whole pipeline with key type K. Returns false, having written nothing,
@@ -596,6 +624,37 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let unknown = cat_rank[&b"unknown"[..]];
     let products: FxHashMap<K, u32> = prod_rows.iter().map(|r| (r.0, cat_rank[r.1])).collect();
     let ncat = cat_names.len();
+    // Canonical `p<digits>` IDs also go in an array by number (u32::MAX = not a product).
+    // An event's product field in that form is looked up there and only there; any
+    // other form falls back to the map, which holds every product.
+    let mut prod_arr: Vec<u32> = Vec::new();
+    {
+        let mut raw = Vec::new();
+        scan::<2, _>(pb, true, |fl| raw.push((product_number(&pb[fl[0].s..fl[0].e]), &pb[fl[1].s..fl[1].e])));
+        let max = raw.iter().filter_map(|r| r.0).max().unwrap_or(0);
+        if max < (1 << 20) {
+            prod_arr = vec![u32::MAX; max + 1];
+            for (n, c) in raw {
+                if let Some(n) = n {
+                    prod_arr[n] = cat_rank[c];
+                }
+            }
+        }
+    }
+    let use_arr = !prod_arr.is_empty();
+    let category_of = |d: &'a [u8], f: Fd| -> u32 {
+        let s = &d[f.s..f.e];
+        if use_arr {
+            if let Some(n) = product_number(s) {
+                return match prod_arr.get(n) {
+                    Some(&c) if c != u32::MAX => c,
+                    _ => unknown,
+                };
+            }
+        }
+        // A product ID that does not fit K is not in products.csv (all of those fit).
+        K::make(d, f.s, f.e).and_then(|p| products.get(&p).copied()).unwrap_or(unknown)
+    };
 
     // ---- Campaigns.
     let mut camp_rows: Vec<(K, &[u8], &[u8])> = Vec::new();
@@ -731,17 +790,38 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     drop(name);
     drop(roots);
     let renamed: usize = link_maps.iter().map(|m| m.len()).sum();
+    // Bit filter of the renamed IDs: a clear bit means "not renamed" for sure, so
+    // most rows skip the maps (which are too big for cache) entirely.
+    let mut filter = vec![0u64; FILTER_BITS / 64];
+    for m in &link_maps {
+        for k in m.keys() {
+            let b = mix(k) as usize & (FILTER_BITS - 1);
+            filter[b >> 6] |= 1 << (b & 63);
+        }
+    }
     log(t0, &format!("links: {nid} ids, {renamed} renamed"));
-    let person_of = |uid: K| -> K { link_maps[shard_of(&uid)].get(&uid).copied().unwrap_or(uid) };
+    let person_of = |uid: K| -> K {
+        let h = mix(&uid);
+        let b = h as usize & (FILTER_BITS - 1);
+        if filter[b >> 6] >> (b & 63) & 1 == 0 {
+            return uid;
+        }
+        link_maps[(h >> 56) as usize & (NB - 1)].get(&uid).copied().unwrap_or(uid)
+    };
 
-    // ---- Events: parse every copy, shard by event_id.
+    // ---- Events: parse every copy. A valid copy's payload is written once,
+    // straight into its person's shard; every copy also sends (id, ingest, where
+    // its payload is) to its event_id shard for dedup.
     let ev_chunks = make_chunks(&inp.events, target);
-    let parsed: Vec<Vec<Vec<ERec<K>>>> = ev_chunks
+    assert!(ev_chunks.len() < 1 << 24, "too many chunks for DRec::loc");
+    let ev_out: Vec<(Vec<Vec<DRec<K>>>, Vec<Vec<PRec<K>>>)> = ev_chunks
         .par_iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(ci, c)| {
             let d = c.data;
             let cap = d.len() / 70 / NB + 4;
-            let mut out: Vec<Vec<ERec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            let mut drec: Vec<Vec<DRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            let mut pay: Vec<Vec<PRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
             scan::<7, _>(d, c.skip_first, |fl| {
                 if fl[0].empty() {
                     return;
@@ -751,7 +831,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     return;
                 };
                 let ingest = parse_ts(&d[fl[3].s..fl[3].e]).unwrap_or(i64::MAX);
-                let mut rec = ERec { id, name: K::default(), ingest, ts: 0, price: 0, cat: INVALID };
+                let mut loc = NO_LOC;
                 'v: {
                     if fl[1].empty() || fl[5].empty() {
                         break 'v;
@@ -775,22 +855,22 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                         fail.store(true, Relaxed);
                         break 'v;
                     };
-                    rec.name = person_of(uid);
-                    // A product ID that does not fit K is not in products.csv (all of those fit).
-                    rec.cat = K::make(d, fl[5].s, fl[5].e)
-                        .and_then(|p| products.get(&p).copied())
-                        .unwrap_or(unknown);
-                    rec.ts = ts;
-                    rec.price = price;
+                    let name = person_of(uid);
+                    let p = shard_of(&name);
+                    let v = &mut pay[p];
+                    assert!(v.len() < 1 << 32);
+                    loc = (ci as u64) << 40 | (p as u64) << 32 | v.len() as u64;
+                    v.push(PRec { name, ts, price, cat: category_of(d, fl[5]) });
                 }
-                out[shard_of(&id)].push(rec);
+                drec[shard_of(&id)].push(DRec { id, ingest, loc });
             });
-            out
+            (drec, pay)
         })
         .collect();
     if fail.load(Relaxed) {
         return false;
     }
+    let (drecs, mut pays): (Vec<_>, Vec<_>) = ev_out.into_iter().unzip();
     log(t0, &format!("events parsed ({} chunks)", ev_chunks.len()));
 
     // ---- Clicks: parse + validate, shard by person.
@@ -827,40 +907,48 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     }
     log(t0, "clicks parsed");
 
-    // ---- Dedup each event_id shard; reshard survivors by person.
-    let dedup: Vec<Vec<Vec<PRec<K>>>> = (0..NB)
-        .into_par_iter()
-        .map_init(
-            || new_map::<K, ERec<K>>(0), // reused from shard to shard
-            |best, b| {
-            let n: usize = parsed.iter().map(|c| c[b].len()).sum();
+    // ---- Dedup each event_id shard: the copy with the smallest ingest_ts is kept
+    // (and if it is invalid, it has no payload, so the event is gone); every other
+    // copy's payload is marked DEAD in place.
+    let ptrs: Vec<Vec<SendPtr>> =
+        pays.iter_mut().map(|v| v.iter_mut().map(|p| SendPtr(p.as_mut_ptr() as usize)).collect()).collect();
+    let kill = |loc: u64| {
+        if loc != NO_LOC {
+            let (c, p, i) = ((loc >> 40) as usize, (loc >> 32) as usize & 0xff, (loc & 0xffff_ffff) as usize);
+            // SAFETY: (c, p, i) is in bounds (it was that payload's index when pushed and
+            // `pays` is not touched until dedup ends), and only the one dedup task that
+            // owns this event_id's shard ever writes this element.
+            unsafe { (*(ptrs[c][p].0 as *mut PRec<K>).add(i)).ts = DEAD };
+        }
+    };
+    (0..NB).into_par_iter().for_each_init(
+        || new_map::<K, (i64, u64)>(0), // reused from shard to shard
+        |best, b| {
+            let n: usize = drecs.iter().map(|c| c[b].len()).sum();
             best.clear();
             best.reserve(n);
-            for c in &parsed {
+            for c in &drecs {
                 for r in &c[b] {
                     match best.entry(r.id) {
                         Entry::Occupied(mut e) => {
-                            if r.ingest < e.get().ingest {
-                                *e.get_mut() = *r;
+                            let (bi, bl) = *e.get();
+                            if r.ingest < bi {
+                                kill(bl);
+                                *e.get_mut() = (r.ingest, r.loc);
+                            } else {
+                                kill(r.loc); // equal ingest_ts means identical copies: keep either
                             }
                         }
                         Entry::Vacant(e) => {
-                            e.insert(*r);
+                            e.insert((r.ingest, r.loc));
                         }
                     }
                 }
             }
-            let mut out: Vec<Vec<PRec<K>>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 4)).collect();
-            for r in best.values() {
-                if r.cat != INVALID {
-                    out[shard_of(&r.name)].push(PRec { name: r.name, ts: r.ts, price: r.price, cat: r.cat });
-                }
-            }
-            out
         },
-        )
-        .collect();
-    drop(parsed);
+    );
+    drop(drecs);
+    let pays = pays; // read-only from here on
     log(t0, "events deduped");
 
     // ---- Per person shard: sessions, credit, assists, aggregates.
@@ -872,14 +960,12 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         .fold(
             || (Vec::new(), vec![[0i64; 4]; size], Scratch::<K>::default()),
             |(mut urows, mut camp, mut sc), p| {
-                process_shard(p, &dedup, &clicks, day0, ndays, ncat, organic, &mut urows, &mut camp, &mut sc);
+                process_shard(p, &pays, &clicks, day0, ndays, ncat, organic, &mut urows, &mut camp, &mut sc);
                 (urows, camp, sc)
             },
         )
         .map(|(u, c, _)| (u, c))
         .collect();
-    drop(dedup);
-    drop(clicks);
     log(t0, "sessions done");
 
     // ---- Write.
@@ -924,7 +1010,10 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         || write_campaign(&cd.join("part-00000.parquet"), &camp_tot, &camp_names, ncamp, ndays, day0),
     );
     log(t0, &format!("wrote {nrows} user rows in {} files", groups.len()));
-    true
+    // The outputs are written and closed. Exit now instead of freeing gigabytes of
+    // buffers one by one; the kernel reclaims everything at once.
+    log(t0, "done");
+    std::process::exit(0);
 }
 
 /// Buffers reused from shard to shard, so each worker allocates (and the
@@ -953,7 +1042,7 @@ struct Scratch<K> {
 #[allow(clippy::too_many_arguments)]
 fn process_shard<'a, K: Key<'a>>(
     p: usize,
-    dedup: &[Vec<Vec<PRec<K>>>],
+    pays: &[Vec<Vec<PRec<K>>>],
     clicks: &[Vec<Vec<CRec<K>>>],
     day0: i64,
     ndays: usize,
@@ -964,7 +1053,8 @@ fn process_shard<'a, K: Key<'a>>(
     sc: &mut Scratch<K>,
 ) {
     // Group events by person (counting sort into one flat array).
-    let n_ev: usize = dedup.iter().map(|d| d[p].len()).sum();
+    let n_ev: usize = pays.iter().map(|d| d[p].len()).sum(); // live and DEAD
+
     if n_ev == 0 {
         return;
     }
@@ -992,8 +1082,11 @@ fn process_shard<'a, K: Key<'a>>(
     names.clear();
     cnt.clear();
     pid_of.clear();
-    for d in dedup {
+    for d in pays {
         for r in &d[p] {
+            if r.ts == DEAD {
+                continue;
+            }
             let id = *index.entry(r.name).or_insert_with(|| {
                 names.push(r.name);
                 cnt.push(0);
@@ -1010,13 +1103,16 @@ fn process_shard<'a, K: Key<'a>>(
         ev_off[i + 1] = ev_off[i] + cnt[i] as usize;
     }
     evs.clear();
-    evs.resize(n_ev, Ev::default());
+    evs.resize(pid_of.len(), Ev::default());
     {
         cur.clear();
         cur.extend_from_slice(&ev_off[..]);
         let mut k = 0;
-        for d in dedup {
+        for d in pays {
             for r in &d[p] {
+                if r.ts == DEAD {
+                    continue; // skipped in the first pass too, so k stays in step
+                }
                 let id = pid_of[k] as usize;
                 k += 1;
                 evs[cur[id]] = Ev { ts: r.ts, price: r.price, cat: r.cat };
