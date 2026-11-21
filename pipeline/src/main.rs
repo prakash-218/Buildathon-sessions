@@ -263,16 +263,30 @@ fn new_map<K, V>(cap: usize) -> FxHashMap<K, V> {
 // ---------------------------------------------------------------------- CSV
 
 /// A field's value as `d[s..e]`, quotes already removed. Empty means null.
+/// Positions are u32 (chunks are far below 4 GB), so a row's fields take half
+/// the registers.
 #[derive(Clone, Copy, Default)]
 struct Fd {
-    s: usize,
-    e: usize,
+    s0: u32,
+    e0: u32,
 }
 
 impl Fd {
     #[inline(always)]
+    fn new(s: usize, e: usize) -> Fd {
+        Fd { s0: s as u32, e0: e as u32 }
+    }
+    #[inline(always)]
+    fn s(self) -> usize {
+        self.s0 as usize
+    }
+    #[inline(always)]
+    fn e(self) -> usize {
+        self.e0 as usize
+    }
+    #[inline(always)]
     fn empty(self) -> bool {
-        self.s == self.e
+        self.s0 == self.e0
     }
 }
 
@@ -332,13 +346,13 @@ fn bits_between(lo: usize, hi: usize) -> u64 {
 /// field (and nowhere inside it). Malformed and empty lines are skipped, and so
 /// is the first line when `skip_first` (the file's header).
 ///
-/// `d[f.s..f.e]` without bounds checks: every Fd the scanners make lies
+/// `d[f.s()..f.e()]` without bounds checks: every Fd the scanners make lies
 /// inside the buffer it came from (s <= e <= len).
 #[inline(always)]
 fn fld(d: &[u8], f: Fd) -> &[u8] {
-    debug_assert!(f.s <= f.e && f.e <= d.len());
+    debug_assert!(f.s() <= f.e() && f.e() <= d.len());
     // SAFETY: see above.
-    unsafe { d.get_unchecked(f.s..f.e) }
+    unsafe { d.get_unchecked(f.s()..f.e()) }
 }
 
 /// `d[i]` without a bounds check, for `i < d.len()`.
@@ -355,11 +369,11 @@ fn at(d: &[u8], i: usize) -> u8 {
 fn unwrap_quotes<const N: usize>(d: &[u8], fl: &mut [Fd; N], quotes: u64) -> bool {
     let mut wrapped = 0u64;
     for x in fl.iter_mut() {
-        if x.e > x.s && at(d, x.s) == b'"' {
-            if x.e < x.s + 2 || at(d, x.e - 1) != b'"' {
+        if x.e() > x.s() && at(d, x.s()) == b'"' {
+            if x.e() < x.s() + 2 || at(d, x.e() - 1) != b'"' {
                 return false; // opens with a quote but does not close with one
             }
-            *x = Fd { s: x.s + 1, e: x.e - 1 };
+            *x = Fd::new(x.s() + 1, x.e() - 1);
             wrapped += 2;
         }
     }
@@ -375,7 +389,7 @@ fn slow_line<const N: usize>(d: &[u8], s: usize, e: usize, fl: &mut [Fd; N]) -> 
             if k >= N {
                 return false;
             }
-            fl[k] = Fd { s: fstart, e: pos };
+            fl[k] = Fd::new(fstart, pos);
             k += 1;
             fstart = pos + 1;
         } else if d[pos] == b'"' {
@@ -409,17 +423,17 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
         let mut fl = [Fd::default(); N];
         let mut s = lstart;
         for j in 0..N {
-            fl[j] = Fd { s, e: seps[j] };
+            fl[j] = Fd::new(s, seps[j]);
             s = seps[j] + 1;
         }
         if quotes != 0 {
             let mut wrapped = 0u64;
             for x in fl.iter_mut() {
-                if x.e > x.s && d[x.s] == b'"' {
-                    if x.e < x.s + 2 || d[x.e - 1] != b'"' {
+                if x.e() > x.s() && d[x.s()] == b'"' {
+                    if x.e() < x.s() + 2 || d[x.e() - 1] != b'"' {
                         return; // opens with a quote but does not close with one
                     }
-                    *x = Fd { s: x.s + 1, e: x.e - 1 };
+                    *x = Fd::new(x.s() + 1, x.e() - 1);
                     wrapped += 2;
                 }
             }
@@ -646,20 +660,20 @@ fn parse_iso_fast(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + h) * 60 + mi) * 60_000 + se * 1000 - off)
 }
 
-/// `parse_ts(&d[f.s..f.e])`, faster: SSE for F1 and F2, and for F3 of up to 16
+/// `parse_ts(&d[f.s()..f.e()])`, faster: SSE for F1 and F2, and for F3 of up to 16
 /// digits (loads may read bytes of `d` before the field, never outside `d`).
 #[inline(always)]
 fn ts_at(d: &[u8], f: Fd) -> Option<i64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
-        let n = f.e - f.s;
+        let n = f.e() - f.s();
         if n == 20 || n == 25 {
             if let Some(v) = iso_sse(fld(d, f)) {
                 return Some(v);
             }
-        } else if (1..=16).contains(&n) && f.e >= 16 {
+        } else if (1..=16).contains(&n) && f.e() >= 16 {
             // Shorter than F1, so only F3 can be valid.
-            return digits_sse(fld(d, Fd { s: f.e - 16, e: f.e }), n).map(|v| v as i64);
+            return digits_sse(fld(d, Fd::new(f.e() - 16, f.e())), n).map(|v| v as i64);
         }
     }
     parse_ts(fld(d, f))
@@ -668,17 +682,17 @@ fn ts_at(d: &[u8], f: Fd) -> Option<i64> {
 /// An F1 timestamp `d[f]` (20 bytes) -> epoch seconds, in one 32-byte load:
 /// separators and digits checked with one compare, the seven digit pairs
 /// (seconds included) gathered by one shuffle and range-checked together.
-/// None for anything else (then `ts_at` decides). Needs f.s + 32 <= d.len().
+/// None for anything else (then `ts_at` decides). Needs f.s() + 32 <= d.len().
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 fn f1_secs(d: &[u8], f: Fd) -> Option<i64> {
     use std::arch::x86_64::*;
-    if f.e - f.s != 20 || f.s + 32 > d.len() {
+    if f.e() - f.s() != 20 || f.s() + 32 > d.len() {
         return None;
     }
-    // SAFETY: f.s + 32 <= d.len().
+    // SAFETY: f.s() + 32 <= d.len().
     let (y, mo, dd, h, mi, se) = unsafe {
-        let v = _mm256_loadu_si256(d.as_ptr().add(f.s) as *const __m256i);
+        let v = _mm256_loadu_si256(d.as_ptr().add(f.s()) as *const __m256i);
         let dg = _mm256_sub_epi8(v, _mm256_set1_epi8(0x30));
         let digit = _mm256_cmpeq_epi8(_mm256_min_epu8(dg, _mm256_set1_epi8(9)), dg);
         let tmpl = _mm256_setr_epi8(
@@ -1064,7 +1078,7 @@ fn main() {
         let maps = map_dir(&data.join("events"));
         let mut tot = 0usize;
         for mm in &maps {
-            let cb = |fl: &[Fd; 7]| tot += fl[3].e - fl[0].s;
+            let cb = |fl: &[Fd; 7]| tot += fl[3].e() - fl[0].s();
             scan::<7, _>(&mm[..], true, cb)
         }
         eprintln!("scanbench {m}: {tot}");
@@ -1141,14 +1155,14 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
         let mut by_num: Vec<(usize, u32)> = Vec::new();
         let mut by_key: Vec<(K, u32)> = Vec::new();
         scan::<2, _>(pb, true, |fl| {
-            let c = &pb[fl[1].s..fl[1].e];
+            let c = &pb[fl[1].s()..fl[1].e()];
             let ci = *seen_idx.entry(c).or_insert_with(|| {
                 seen.push(c);
                 (seen.len() - 1) as u32
             });
-            match product_number(&pb[fl[0].s..fl[0].e]) {
+            match product_number(&pb[fl[0].s()..fl[0].e()]) {
                 Some(n) => by_num.push((n, ci)),
-                None => match K::make(pb, fl[0].s, fl[0].e) {
+                None => match K::make(pb, fl[0].s(), fl[0].e()) {
                     Some(k) => by_key.push((k, ci)),
                     None => ok = false,
                 },
@@ -1184,8 +1198,8 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
         let products: FxHashMap<K, u32> = by_key.iter().map(|&(k, ci)| (k, rank[ci as usize])).collect();
         let mut camp_rows: Vec<(K, &[u8], &[u8])> = Vec::new();
         let cb = inp.campaigns;
-        scan::<2, _>(cb, true, |fl| match K::make(cb, fl[0].s, fl[0].e) {
-            Some(k) => camp_rows.push((k, &cb[fl[0].s..fl[0].e], &cb[fl[1].s..fl[1].e])),
+        scan::<2, _>(cb, true, |fl| match K::make(cb, fl[0].s(), fl[0].e()) {
+            Some(k) => camp_rows.push((k, &cb[fl[0].s()..fl[0].e()], &cb[fl[1].s()..fl[1].e()])),
             None => ok = false,
         });
         let campaigns: FxHashMap<K, u32> = camp_rows.iter().enumerate().map(|(i, r)| (r.0, i as u32)).collect();
@@ -1203,7 +1217,7 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
         ok.then_some(Catalog { cat_names, ncat, unknown, products, prod_arr, camp_rows, campaigns, camp_arr, ncamp })
     }
 
-    /// The campaign index of `d[f.s..f.e]`, or None if it is not in campaigns.csv.
+    /// The campaign index of `d[f.s()..f.e()]`, or None if it is not in campaigns.csv.
     /// Canonical `c_<digits>` IDs are looked up in the array and only there.
     #[inline(always)]
     fn campaign_of(&self, d: &'a [u8], f: Fd) -> Option<u32> {
@@ -1213,7 +1227,7 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
                 return self.camp_arr.get(n).copied().filter(|&c| c != u32::MAX);
             }
         }
-        K::make(d, f.s, f.e).and_then(|k| self.campaigns.get(&k).copied())
+        K::make(d, f.s(), f.e()).and_then(|k| self.campaigns.get(&k).copied())
     }
 
     #[inline(always)]
@@ -1228,7 +1242,7 @@ impl<'a, K: Key<'a>> Catalog<'a, K> {
             }
         }
         // A product ID that does not fit K is not in products.csv (all of those fit).
-        K::make(d, f.s, f.e).and_then(|p| self.products.get(&p).copied()).unwrap_or(self.unknown)
+        K::make(d, f.s(), f.e()).and_then(|p| self.products.get(&p).copied()).unwrap_or(self.unknown)
     }
 }
 
@@ -1265,7 +1279,7 @@ fn link_components<'a, K: Key<'a>>(inp: &Inputs<'a>, target: usize, threads: usi
                 if fl[0].empty() || fl[1].empty() {
                     return;
                 }
-                match (K::make(d, fl[0].s, fl[0].e), K::make(d, fl[1].s, fl[1].e)) {
+                match (K::make(d, fl[0].s(), fl[0].e()), K::make(d, fl[1].s(), fl[1].e())) {
                     (Some(a), Some(b)) => v.push((a, b)),
                     _ => fail.store(true, Relaxed),
                 }
@@ -1458,22 +1472,22 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 if fl[0].empty() {
                     return;
                 }
-                let Some(id) = K::make(d, fl[0].s, fl[0].e) else {
+                let Some(id) = K::make(d, fl[0].s(), fl[0].e()) else {
                     fail.store(true, Relaxed);
                     return;
                 };
-                let ingest = parse_ts(&d[fl[3].s..fl[3].e]).unwrap_or(i64::MAX);
+                let ingest = parse_ts(&d[fl[3].s()..fl[3].e()]).unwrap_or(i64::MAX);
                 'v: {
                     if fl[1].empty() || fl[5].empty() {
                         break 'v;
                     }
-                    let Some(ts) = parse_ts(&d[fl[2].s..fl[2].e]) else { break 'v };
+                    let Some(ts) = parse_ts(&d[fl[2].s()..fl[2].e()]) else { break 'v };
                     if ts < ws || ts >= we {
                         break 'v;
                     }
-                    let price = match &d[fl[4].s..fl[4].e] {
+                    let price = match &d[fl[4].s()..fl[4].e()] {
                         b"view" | b"cart" => 0,
-                        b"purchase" => match parse_price(&d[fl[6].s..fl[6].e]) {
+                        b"purchase" => match parse_price(&d[fl[6].s()..fl[6].e()]) {
                             Some(p) => p,
                             None => break 'v,
                         },
@@ -1482,7 +1496,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     if ingest.saturating_sub(ts) > DAY {
                         break 'v; // late
                     }
-                    let Some(uid) = K::make(d, fl[1].s, fl[1].e) else {
+                    let Some(uid) = K::make(d, fl[1].s(), fl[1].e()) else {
                         fail.store(true, Relaxed);
                         break 'v;
                     };
@@ -1535,14 +1549,14 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
                 }
-                let Some(camp) = K::make(d, fl[2].s, fl[2].e).and_then(|k| campaigns.get(&k).copied()) else {
+                let Some(camp) = K::make(d, fl[2].s(), fl[2].e()).and_then(|k| campaigns.get(&k).copied()) else {
                     return;
                 };
-                let Some(ts) = parse_ts(&d[fl[3].s..fl[3].e]) else { return };
+                let Some(ts) = parse_ts(&d[fl[3].s()..fl[3].e()]) else { return };
                 if ts < ws - WEEK || ts >= we {
                     return;
                 }
-                let (Some(id), Some(uid)) = (K::make(d, fl[0].s, fl[0].e), K::make(d, fl[1].s, fl[1].e)) else {
+                let (Some(id), Some(uid)) = (K::make(d, fl[0].s(), fl[0].e()), K::make(d, fl[1].s(), fl[1].e())) else {
                     fail.store(true, Relaxed);
                     return;
                 };
@@ -2221,7 +2235,7 @@ mod tests {
             let start = d.len();
             d.extend_from_slice(&s);
             d.extend_from_slice(b",yyyy");
-            let f = Fd { s: start, e: start + s.len() };
+            let f = Fd::new(start, start + s.len());
             d.extend_from_slice(b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
             assert_eq!(ts_at(&d, f), parse_ts_slow(&s), "{:?}", String::from_utf8_lossy(&s));
             assert_eq!(ts_fast(&d, f), parse_ts_slow(&s), "fast {:?}", String::from_utf8_lossy(&s));
@@ -2259,9 +2273,9 @@ mod scan_tests {
                 if !bad {
                     if k < N {
                         if qcnt == 0 {
-                            fl[k] = Fd { s: fstart, e: pos };
+                            fl[k] = Fd::new(fstart, pos);
                         } else if qcnt == 2 && qfirst == fstart && qlast + 1 == pos {
-                            fl[k] = Fd { s: fstart + 1, e: pos - 1 };
+                            fl[k] = Fd::new(fstart + 1, pos - 1);
                         } else {
                             bad = true;
                         }
@@ -2319,7 +2333,7 @@ mod scan_tests {
 
     fn collect<const N: usize>(d: &[u8], skip: bool, new: bool) -> Vec<Vec<(usize, usize)>> {
         let mut out = Vec::new();
-        let mut push = |fl: &[Fd; N]| out.push(fl.iter().map(|f| (f.s, f.e)).collect());
+        let mut push = |fl: &[Fd; N]| out.push(fl.iter().map(|f| (f.s(), f.e())).collect());
         if new { scan::<N, _>(d, skip, &mut push) } else { scan_ref::<N, _>(d, skip, &mut push) }
         out
     }

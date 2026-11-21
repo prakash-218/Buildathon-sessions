@@ -122,14 +122,14 @@ fn b36(d: &[u8], s: usize, e: usize) -> Option<u64> {
 #[inline(always)]
 fn b36x2(d: &[u8], a: Fd, pa: u8, b: Fd, pb: u8) -> (Option<u64>, Option<u64>) {
     use std::arch::x86_64::*;
-    let (na, nb) = (a.e.wrapping_sub(a.s).wrapping_sub(1), b.e.wrapping_sub(b.s).wrapping_sub(1));
-    if na.wrapping_sub(1) >= 8 || nb.wrapping_sub(1) >= 8 || a.e < 9 || b.e < 9 {
-        let one = |f: Fd, p: u8| (f.e > f.s && d[f.s] == p).then(|| b36(d, f.s + 1, f.e)).flatten();
+    let (na, nb) = (a.e().wrapping_sub(a.s()).wrapping_sub(1), b.e().wrapping_sub(b.s()).wrapping_sub(1));
+    if na.wrapping_sub(1) >= 8 || nb.wrapping_sub(1) >= 8 || a.e() < 9 || b.e() < 9 {
+        let one = |f: Fd, p: u8| (f.e() > f.s() && d[f.s()] == p).then(|| b36(d, f.s() + 1, f.e())).flatten();
         return (one(a, pa), one(b, pb));
     }
     // SAFETY: 9 <= e <= d.len() for both fields, so the 8 bytes before e are in d.
-    let wa = unsafe { (d.as_ptr().add(a.e - 8) as *const u64).read_unaligned() };
-    let wb = unsafe { (d.as_ptr().add(b.e - 8) as *const u64).read_unaligned() };
+    let wa = unsafe { (d.as_ptr().add(a.e() - 8) as *const u64).read_unaligned() };
+    let wb = unsafe { (d.as_ptr().add(b.e() - 8) as *const u64).read_unaligned() };
     let (ka, kb) = (!0u64 << (8 * (8 - na)), !0u64 << (8 * (8 - nb)));
     let wa = (wa & ka) | (0x30 * ONES & !ka);
     let wb = (wb & kb) | (0x30 * ONES & !kb);
@@ -148,8 +148,8 @@ fn b36x2(d: &[u8], a: Fd, pa: u8, b: Fd, pb: u8) -> (Option<u64>, Option<u64>) {
         (ok, [_mm_cvtsi128_si64(r) as u64, _mm_extract_epi64::<1>(r) as u64])
     };
     let lead0 = |w: u64, n: usize| n > 1 && (w >> (8 * (8 - n))) as u8 == b'0';
-    let ra = (at(d, a.s) == pa && ok & 0xff == 0xff && !lead0(wa, na) && r[0] <= MASK).then_some(r[0]);
-    let rb = (at(d, b.s) == pb && ok >> 8 == 0xff && !lead0(wb, nb) && r[1] <= MASK).then_some(r[1]);
+    let ra = (at(d, a.s()) == pa && ok & 0xff == 0xff && !lead0(wa, na) && r[0] <= MASK).then_some(r[0]);
+    let rb = (at(d, b.s()) == pb && ok >> 8 == 0xff && !lead0(wb, nb) && r[1] <= MASK).then_some(r[1]);
     (ra, rb)
 }
 
@@ -196,7 +196,7 @@ fn packed_id(prefix: u8, mut y: u64) -> u64 {
 /// fits. With a = x1 ^ key and b = x2 ^ key, a - b must be T = A*d. The borrow
 /// into bit k of a - b is then T_k ^ e_k (e = x1 ^ x2, which needs no key).
 /// Where x1 and x2 agree the borrow passes through unchanged (a check); where
-/// they differ, the borrow out of bit k is set iff a_k = 0, i.e. iff key_k = x1_k.
+/// they differ, the borrow out of bit k is set iff a_k = 0, i.e(). iff key_k = x1_k.
 #[inline(always)]
 fn pair_bits(x1: u64, x2: u64, d: u64) -> Option<(u64, u64)> {
     const LOW39: u64 = (1 << 39) - 1;
@@ -375,10 +375,10 @@ fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<[Fd; N]>, u
         for x in fl.iter_mut().take(N - 1) {
             let p = ls + m.trailing_zeros() as usize;
             m &= m - 1;
-            *x = Fd { s, e: p };
+            *x = Fd::new(s, p);
             s = p + 1;
         }
-        fl[N - 1] = Fd { s, e: ls + e as usize };
+        fl[N - 1] = Fd::new(s, ls + e as usize);
         let quotes = ((mask(v0, b'"') | mask(v1, b'"') << 32) & below).count_ones() as u64;
         if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
             return Some((None, next));
@@ -404,10 +404,10 @@ fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<[Fd; N]>, u
     for x in fl.iter_mut().take(N - 1) {
         let p = ls + m.trailing_zeros() as usize;
         m &= m - 1;
-        *x = Fd { s, e: p };
+        *x = Fd::new(s, p);
         s = p + 1;
     }
-    fl[N - 1] = Fd { s, e: ls + e as usize };
+    fl[N - 1] = Fd::new(s, ls + e as usize);
     let quotes = (wide(b'"') & below).count_ones() as u64;
     if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
         return Some((None, next));
@@ -450,15 +450,15 @@ enum Uid {
 /// below `pmax`, else its packed key; None if it does not fit a packed key.
 #[inline(always)]
 fn uid(d: &[u8], f: Fd, ukey: u64, pmax: u64) -> Option<Uid> {
-    if f.e > f.s && d[f.s] == b'u' {
-        if let Some(y) = b36(d, f.s + 1, f.e) {
+    if f.e() > f.s() && d[f.s()] == b'u' {
+        if let Some(y) = b36(d, f.s() + 1, f.e()) {
             let v = unscramble(y, ukey);
             if v < KIOSK && (v >> 9) < pmax {
                 return Some(Uid::Norm(v as u32));
             }
         }
     }
-    <u64 as Key<'_>>::make(d, f.s, f.e).map(Uid::Other)
+    <u64 as Key<'_>>::make(d, f.s(), f.e()).map(Uid::Other)
 }
 
 /// Run `work` on chunks 0..n from `threads` scoped threads, each with its own
@@ -529,8 +529,8 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
             let d = head(c, 48 << 10);
             let mut v = Vec::new();
             scan::<7, _>(d, c.skip_first, |fl| {
-                let e = (fl[0].e > fl[0].s && d[fl[0].s] == b'e').then(|| b36(d, fl[0].s + 1, fl[0].e)).flatten();
-                let u = (fl[1].e > fl[1].s && d[fl[1].s] == b'u').then(|| b36(d, fl[1].s + 1, fl[1].e)).flatten();
+                let e = (fl[0].e() > fl[0].s() && d[fl[0].s()] == b'e').then(|| b36(d, fl[0].s() + 1, fl[0].e())).flatten();
+                let u = (fl[1].e() > fl[1].s() && d[fl[1].s()] == b'u').then(|| b36(d, fl[1].s() + 1, fl[1].e())).flatten();
                 v.push((e, u));
             });
             v
@@ -551,7 +551,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     for c in &ln_chunks {
         let d = head(c, 256 << 10);
         scan::<2, _>(d, c.skip_first, |fl| {
-            let dec = |f: Fd| (f.e > f.s && d[f.s] == b'u').then(|| b36(d, f.s + 1, f.e)).flatten();
+            let dec = |f: Fd| (f.e() > f.s() && d[f.s()] == b'u').then(|| b36(d, f.s() + 1, f.e())).flatten();
             if let (Some(a), Some(b)) = (dec(fl[0]), dec(fl[1])) {
                 if a != b {
                     link_pairs.push((a, b));
@@ -626,7 +626,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 let root = comps.roots[comps.base[s] as usize + j];
                 buf.clear();
                 k.put(&mut buf);
-                let f = Fd { s: 0, e: buf.len() };
+                let f = Fd::new(0, buf.len());
                 match uid(&buf, f, ukey, pmax) {
                     Some(Uid::Norm(v)) => norm.push((v, root)),
                     _ => other.push((k, root)),
@@ -766,7 +766,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     let norm = yu.map(|y| unscramble(y, ukey)).filter(|&v| v < KIOSK && (v >> 9) < pmax);
                     let u = match norm {
                         Some(v) => Some(Uid::Norm(v as u32)),
-                        None => <u64 as Key<'_>>::make(d, fl[1].s, fl[1].e).map(Uid::Other),
+                        None => <u64 as Key<'_>>::make(d, fl[1].s(), fl[1].e()).map(Uid::Other),
                     };
                     user = match u {
                         Some(Uid::Norm(v)) => v,
@@ -790,7 +790,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 let num = ye.map(|y| unscramble(y, ekey));
                 match num {
                     Some(i) if i < imax => st.shards[(i >> SH) as usize].push(ERec { i: i as u32, ingest, ts, user, info }),
-                    _ => match <u64 as Key<'_>>::make(d, fl[0].s, fl[0].e) {
+                    _ => match <u64 as Key<'_>>::make(d, fl[0].s(), fl[0].e()) {
                         Some(key) => st.odd.push(OddEv { key, ingest, ts, user, info }),
                         None => bad.store(true, Relaxed),
                     },
@@ -995,7 +995,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 if ts < cl_base || ts >= we {
                     return;
                 }
-                let (Some(id), Some(u)) = (<u64 as Key<'_>>::make(d, fl[0].s, fl[0].e), uid(d, fl[1], ukey, pmax)) else {
+                let (Some(id), Some(u)) = (<u64 as Key<'_>>::make(d, fl[0].s(), fl[0].e()), uid(d, fl[1], ukey, pmax)) else {
                     bad.store(true, Relaxed);
                     return;
                 };
@@ -1366,10 +1366,10 @@ mod tests {
                     };
                     d.push(c);
                 }
-                fields.push(Fd { s: start, e: d.len() });
+                fields.push(Fd::new(start, d.len()));
                 d.push(b',');
             }
-            let one = |f: Fd, p: u8| (f.e > f.s && d[f.s] == p).then(|| b36(&d, f.s + 1, f.e)).flatten();
+            let one = |f: Fd, p: u8| (f.e() > f.s() && d[f.s()] == p).then(|| b36(&d, f.s() + 1, f.e())).flatten();
             assert_eq!(b36x2(&d, fields[0], b'e', fields[1], b'u'), (one(fields[0], b'e'), one(fields[1], b'u')), "{:?}", String::from_utf8_lossy(&d));
         }
     }
