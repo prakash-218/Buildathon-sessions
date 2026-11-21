@@ -18,8 +18,14 @@
 
 use memchr::memchr;
 use memmap2::{Advice, Mmap};
+
+// mimalloc reuses freed memory (with MIMALLOC_PURGE_DELAY=-1, set in the
+// Dockerfile, it never hands it back), so later phases do not fault in and
+// zero fresh pages: 497k page faults per 20M-event run with glibc, 16k with this.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesPtr};
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use rayon::prelude::*;
@@ -630,58 +636,103 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     if fail.load(Relaxed) {
         return false;
     }
-    let link_map: FxHashMap<K, K> = {
-        let n: usize = pairs.iter().map(|v| v.len()).sum();
-        let mut ids: FxHashMap<K, u32> = new_map(n);
-        let mut parent: Vec<u32> = Vec::with_capacity(n);
-        let mut keys: Vec<K> = Vec::with_capacity(n);
-        fn find(parent: &mut [u32], mut x: u32) -> u32 {
-            while parent[x as usize] != x {
-                let g = parent[parent[x as usize] as usize];
-                parent[x as usize] = g;
-                x = g;
-            }
-            x
-        }
-        for v in &pairs {
+    // Number the distinct IDs: shard every occurrence by hash, and number each
+    // shard on its own thread. Global index = shard base + index in the shard.
+    let occ: Vec<Vec<Vec<K>>> = pairs
+        .par_iter()
+        .map(|v| {
+            let mut out: Vec<Vec<K>> = (0..NB).map(|_| Vec::with_capacity(v.len() * 2 / NB + 4)).collect();
             for &(a, b) in v {
-                let mut intern = |s: K| -> u32 {
-                    *ids.entry(s).or_insert_with(|| {
-                        let i = parent.len() as u32;
-                        parent.push(i);
-                        keys.push(s);
-                        i
-                    })
-                };
-                let ia = intern(a);
-                let ib = intern(b);
-                let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-                if ra != rb {
-                    let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
-                    parent[hi as usize] = lo;
+                out[shard_of(&a)].push(a);
+                out[shard_of(&b)].push(b);
+            }
+            out
+        })
+        .collect();
+    let id_shards: Vec<(Vec<K>, FxHashMap<K, u32>)> = (0..NB)
+        .into_par_iter()
+        .map(|s| {
+            let n: usize = occ.iter().map(|o| o[s].len()).sum();
+            let mut map: FxHashMap<K, u32> = new_map(n / 2 + 4);
+            let mut keys: Vec<K> = Vec::with_capacity(n / 2 + 4);
+            for o in &occ {
+                for &k in &o[s] {
+                    map.entry(k).or_insert_with(|| {
+                        keys.push(k);
+                        (keys.len() - 1) as u32
+                    });
                 }
             }
-        }
-        let roots: Vec<u32> = (0..keys.len() as u32).map(|i| find(&mut parent, i)).collect();
-        let mut name: Vec<Option<K>> = vec![None; keys.len()];
-        for (i, &r) in roots.iter().enumerate() {
-            let slot = &mut name[r as usize];
-            if slot.is_none_or(|nm| keys[i] < nm) {
-                *slot = Some(keys[i]);
-            }
-        }
-        let mut m = new_map(keys.len());
-        for (i, &r) in roots.iter().enumerate() {
-            let nm = name[r as usize].unwrap();
-            if nm != keys[i] {
-                m.insert(keys[i], nm);
-            }
-        }
-        m
+            (keys, map)
+        })
+        .collect();
+    drop(occ);
+    let mut base = vec![0u32; NB + 1];
+    for s in 0..NB {
+        base[s + 1] = base[s] + id_shards[s].0.len() as u32;
+    }
+    let nid = base[NB] as usize;
+    let gidx = |k: &K| -> u32 {
+        let s = shard_of(k);
+        base[s] + id_shards[s].1[k]
     };
+    let idx_pairs: Vec<Vec<(u32, u32)>> =
+        pairs.par_iter().map(|v| v.iter().map(|(a, b)| (gidx(a), gidx(b))).collect()).collect();
     drop(pairs);
-    log(t0, &format!("links: {} renamed ids", link_map.len()));
-    let person_of = |uid: K| -> K { link_map.get(&uid).copied().unwrap_or(uid) };
+
+    // Union-find over the indices (cheap: plain u32 arrays).
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let g = parent[parent[x as usize] as usize];
+            parent[x as usize] = g;
+            x = g;
+        }
+        x
+    }
+    let mut parent: Vec<u32> = (0..nid as u32).collect();
+    for v in &idx_pairs {
+        for &(a, b) in v {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                parent[hi as usize] = lo;
+            }
+        }
+    }
+    drop(idx_pairs);
+    let roots: Vec<u32> = (0..nid as u32).map(|i| find(&mut parent, i)).collect();
+    drop(parent);
+    // Each person's name: the byte-wise smallest of its IDs.
+    let mut name: Vec<Option<K>> = vec![None; nid];
+    for (s, (keys, _)) in id_shards.iter().enumerate() {
+        for (i, &k) in keys.iter().enumerate() {
+            let slot = &mut name[roots[base[s] as usize + i] as usize];
+            if slot.is_none_or(|nm| k < nm) {
+                *slot = Some(k);
+            }
+        }
+    }
+    // ID -> name, only for IDs that are not their person's name, sharded like the IDs.
+    let link_maps: Vec<FxHashMap<K, K>> = id_shards
+        .par_iter()
+        .enumerate()
+        .map(|(s, (keys, _))| {
+            let mut m = new_map(keys.len());
+            for (i, &k) in keys.iter().enumerate() {
+                let nm = name[roots[base[s] as usize + i] as usize].unwrap();
+                if nm != k {
+                    m.insert(k, nm);
+                }
+            }
+            m
+        })
+        .collect();
+    drop(id_shards);
+    drop(name);
+    drop(roots);
+    let renamed: usize = link_maps.iter().map(|m| m.len()).sum();
+    log(t0, &format!("links: {nid} ids, {renamed} renamed"));
+    let person_of = |uid: K| -> K { link_maps[shard_of(&uid)].get(&uid).copied().unwrap_or(uid) };
 
     // ---- Events: parse every copy, shard by event_id.
     let ev_chunks = make_chunks(&inp.events, target);
@@ -779,9 +830,12 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     // ---- Dedup each event_id shard; reshard survivors by person.
     let dedup: Vec<Vec<Vec<PRec<K>>>> = (0..NB)
         .into_par_iter()
-        .map(|b| {
+        .map_init(
+            || new_map::<K, ERec<K>>(0), // reused from shard to shard
+            |best, b| {
             let n: usize = parsed.iter().map(|c| c[b].len()).sum();
-            let mut best: FxHashMap<K, ERec<K>> = new_map(n);
+            best.clear();
+            best.reserve(n);
             for c in &parsed {
                 for r in &c[b] {
                     match best.entry(r.id) {
@@ -803,7 +857,8 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 }
             }
             out
-        })
+        },
+        )
         .collect();
     drop(parsed);
     log(t0, "events deduped");
@@ -815,12 +870,13 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let results: Vec<(Vec<URow<K>>, Vec<[i64; 4]>)> = (0..NB)
         .into_par_iter()
         .fold(
-            || (Vec::new(), vec![[0i64; 4]; size]),
-            |(mut urows, mut camp), p| {
-                process_shard(p, &dedup, &clicks, day0, ndays, ncat, organic, &mut urows, &mut camp);
-                (urows, camp)
+            || (Vec::new(), vec![[0i64; 4]; size], Scratch::<K>::default()),
+            |(mut urows, mut camp, mut sc), p| {
+                process_shard(p, &dedup, &clicks, day0, ndays, ncat, organic, &mut urows, &mut camp, &mut sc);
+                (urows, camp, sc)
             },
         )
+        .map(|(u, c, _)| (u, c))
         .collect();
     drop(dedup);
     drop(clicks);
@@ -871,6 +927,29 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     true
 }
 
+/// Buffers reused from shard to shard, so each worker allocates (and the
+/// kernel zeroes) them once instead of 256 times.
+#[derive(Default)]
+struct Scratch<K> {
+    index: FxHashMap<K, u32>,
+    names: Vec<K>,
+    cnt: Vec<u32>,
+    pid_of: Vec<u32>,
+    ev_off: Vec<usize>,
+    cur: Vec<usize>,
+    evs: Vec<Ev>,
+    ccnt: Vec<u32>,
+    cpid: Vec<u32>,
+    cl_off: Vec<usize>,
+    cls: Vec<Cl<K>>,
+    catsum: Vec<u64>,
+    touched: Vec<u32>,
+    starts: Vec<i64>,
+    sdays: Vec<u32>,
+    run_end: Vec<u32>,
+    pairs: Vec<(u32, i64)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_shard<'a, K: Key<'a>>(
     p: usize,
@@ -882,16 +961,37 @@ fn process_shard<'a, K: Key<'a>>(
     organic: usize,
     urows: &mut Vec<URow<K>>,
     camp: &mut [[i64; 4]],
+    sc: &mut Scratch<K>,
 ) {
     // Group events by person (counting sort into one flat array).
     let n_ev: usize = dedup.iter().map(|d| d[p].len()).sum();
     if n_ev == 0 {
         return;
     }
-    let mut index: FxHashMap<K, u32> = new_map(n_ev / 8 + 16);
-    let mut names: Vec<K> = Vec::new();
-    let mut cnt: Vec<u32> = Vec::new();
-    let mut pid_of: Vec<u32> = Vec::with_capacity(n_ev);
+    let Scratch {
+        index,
+        names,
+        cnt,
+        pid_of,
+        ev_off,
+        cur,
+        evs,
+        ccnt,
+        cpid,
+        cl_off,
+        cls,
+        catsum,
+        touched,
+        starts,
+        sdays,
+        run_end,
+        pairs,
+    } = sc;
+    index.clear();
+    index.reserve(n_ev / 8 + 16);
+    names.clear();
+    cnt.clear();
+    pid_of.clear();
     for d in dedup {
         for r in &d[p] {
             let id = *index.entry(r.name).or_insert_with(|| {
@@ -904,13 +1004,16 @@ fn process_shard<'a, K: Key<'a>>(
         }
     }
     let np = names.len();
-    let mut ev_off = vec![0usize; np + 1];
+    ev_off.clear();
+    ev_off.resize(np + 1, 0);
     for i in 0..np {
         ev_off[i + 1] = ev_off[i] + cnt[i] as usize;
     }
-    let mut evs = vec![Ev::default(); n_ev];
+    evs.clear();
+    evs.resize(n_ev, Ev::default());
     {
-        let mut cur = ev_off.clone();
+        cur.clear();
+        cur.extend_from_slice(&ev_off[..]);
         let mut k = 0;
         for d in dedup {
             for r in &d[p] {
@@ -921,11 +1024,11 @@ fn process_shard<'a, K: Key<'a>>(
             }
         }
     }
-    drop(pid_of);
 
     // Group clicks the same way; clicks of people with no session are irrelevant.
-    let mut ccnt = vec![0u32; np];
-    let mut cpid: Vec<u32> = Vec::new();
+    ccnt.clear();
+    ccnt.resize(np, 0);
+    cpid.clear();
     for c in clicks {
         for r in &c[p] {
             match index.get(&r.name) {
@@ -937,13 +1040,16 @@ fn process_shard<'a, K: Key<'a>>(
             }
         }
     }
-    let mut cl_off = vec![0usize; np + 1];
+    cl_off.clear();
+    cl_off.resize(np + 1, 0);
     for i in 0..np {
         cl_off[i + 1] = cl_off[i] + ccnt[i] as usize;
     }
-    let mut cls: Vec<Cl<K>> = vec![Cl::default(); cl_off[np]];
+    cls.clear();
+    cls.resize(cl_off[np], Cl::default());
     {
-        let mut cur = cl_off.clone();
+        cur.clear();
+        cur.extend_from_slice(&cl_off[..]);
         let mut k = 0;
         for c in clicks {
             for r in &c[p] {
@@ -957,14 +1063,9 @@ fn process_shard<'a, K: Key<'a>>(
             }
         }
     }
-    drop(cpid);
-
-    let mut catsum = vec![0u64; ncat];
-    let mut touched: Vec<u32> = Vec::new();
-    let mut starts: Vec<i64> = Vec::new();
-    let mut sdays: Vec<u32> = Vec::new();
-    let mut run_end: Vec<u32> = Vec::new();
-    let mut pairs: Vec<(u32, i64)> = Vec::new();
+    catsum.clear();
+    catsum.resize(ncat, 0);
+    touched.clear();
 
     for pid in 0..np {
         let ev = &mut evs[ev_off[pid]..ev_off[pid + 1]];
@@ -1006,7 +1107,7 @@ fn process_shard<'a, K: Key<'a>>(
             let mut purchased = false;
             if day != cur_day {
                 if cur_day != u32::MAX {
-                    flush(cur_day, u_sess, u_ev, u_rev, &mut catsum, &mut touched, urows);
+                    flush(cur_day, u_sess, u_ev, u_rev, catsum, touched, urows);
                 }
                 cur_day = day;
                 u_sess = 0;
@@ -1046,7 +1147,7 @@ fn process_shard<'a, K: Key<'a>>(
             i = j;
         }
         if cur_day != u32::MAX {
-            flush(cur_day, u_sess, u_ev, u_rev, &mut catsum, &mut touched, urows);
+            flush(cur_day, u_sess, u_ev, u_rev, catsum, touched, urows);
         }
 
         // Assists: campaign c assists session S iff some click t of c has t <= S <= t + 7d.
@@ -1102,6 +1203,16 @@ fn put<T: DataType, W: Write + Send>(rg: &mut SerializedRowGroupWriter<'_, W>, v
     col.close().expect("close column");
 }
 
+/// No dictionaries or statistics: user IDs are all distinct, and nothing reads the stats.
+fn props() -> WriterPropertiesPtr {
+    Arc::new(
+        WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build(),
+    )
+}
+
 fn bytes(v: &[u8]) -> ByteArray {
     ByteArray::from(v.to_vec())
 }
@@ -1119,9 +1230,8 @@ fn write_user<'a, K: Key<'a>>(path: &Path, parts: &[&[URow<K>]], cat_names: &[&[
         }",
     )
     .unwrap();
-    let props = WriterProperties::builder().build();
     let file = BufWriter::with_capacity(1 << 20, File::create(path).expect("create parquet"));
-    let mut w = SerializedFileWriter::new(file, Arc::new(schema), Arc::new(props)).unwrap();
+    let mut w = SerializedFileWriter::new(file, Arc::new(schema), props()).unwrap();
     if !rows.is_empty() {
         let mut rg = w.next_row_group().unwrap();
         let names: Vec<ByteArray> = rows
@@ -1176,9 +1286,8 @@ fn write_campaign(path: &Path, tot: &[[i64; 4]], camp_names: &[(&[u8], &[u8])], 
             asst.push(t[3]);
         }
     }
-    let props = WriterProperties::builder().build();
     let file = BufWriter::new(File::create(path).expect("create parquet"));
-    let mut w = SerializedFileWriter::new(file, Arc::new(schema), Arc::new(props)).unwrap();
+    let mut w = SerializedFileWriter::new(file, Arc::new(schema), props()).unwrap();
     if !ids.is_empty() {
         let mut rg = w.next_row_group().unwrap();
         put::<ByteArrayType, _>(&mut rg, &ids, None);

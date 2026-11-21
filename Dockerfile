@@ -13,6 +13,8 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 COPY --from=build /build/target/release/sessions /usr/local/bin/sessions
+# mimalloc: keep freed memory for reuse instead of returning it to the OS.
+ENV MIMALLOC_PURGE_DELAY=-1
 # The scorer runs as uid 1000 with a read-only root; the binary needs neither a home nor temp files.
 USER 1000:1000
 CMD ["/usr/local/bin/sessions"]

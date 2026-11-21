@@ -19,11 +19,13 @@ Our entry for the Builders Buildathon Databricks track: turn messy click-stream 
 
 1. mmap every input file and cut them all into line-aligned chunks, so 8 threads share the parsing however the file sizes are skewed. Each chunk is scanned once with AVX2: 64 bytes at a time become newline, comma and quote bitmasks, and the parser walks the bits.
    IDs are packed into integers that keep byte-wise order: `u64` (up to 9 ASCII bytes, which covers every generated ID), else `u128` (up to 15 bytes), else the run is redone with byte-slice keys. `KEYS=128` or `KEYS=slice` forces a fallback, for testing.
-2. Links: union-find over the IDs; each person is named by its byte-wise smallest ID.
+2. Links: IDs are numbered in 256 hash shards in parallel, union-find runs over the numbers, and each person is named by its byte-wise smallest ID.
 3. Events: every copy is parsed and validated in parallel, sharded by `event_id`. Each shard keeps the copy with the smallest `ingest_ts`, and that copy's validity decides. Survivors are resharded by person.
 4. Clicks: validated and sharded by person. No dedup: copies are identical, so they cannot change a credit or an assist.
 5. Per person: sort, split sessions on gaps over 30 min, credit each session with a two-pointer over the clicks, and count assists by merging each campaign's `[t, t + 7 days]` windows into intervals.
-6. Write the tables as Parquet, one file per thread.
+6. Write the tables as Parquet, one file per thread, without dictionaries or statistics.
+
+Memory comes from mimalloc with `MIMALLOC_PURGE_DELAY=-1` (set in the Dockerfile), and each worker reuses its hash maps and buffers across shards, so later phases reuse memory instead of faulting in fresh pages.
 
 ## Status
 
@@ -32,9 +34,11 @@ Our entry for the Builders Buildathon Databricks track: turn messy click-stream 
 | Fixtures, on each key type (`u64`, `u128`, slices) | 36/36 |
 | Dev set (seed 1, 1M events) vs `dev-answer/` | exact match |
 | Seeds 2, 3 (1M events) and 11 (5M events) vs the reference | exact match |
-| 20M events (seed 7), local laptop, 8 CPUs | 5.8 to 8.4 s in the container (too noisy to rank changes) |
+| 20M events (seed 7), local laptop, 8 CPUs | 4.3 to 4.8 s in the container; about 16k page faults |
 
-The track's baseline is 171.91 s. Commit a6ee49b (before the AVX2 parser and packed keys) scored 4.09 s on the practice board.
+The track's baseline is 171.91 s. Practice board: a6ee49b (first version) 4.09 s; 581d3f3 (AVX2 parser, packed keys) 2.07 s.
+
+Local wall times on a laptop under WSL2 swing by ±30%, so page faults (`perf stat -e page-faults`, deterministic) and profiles are better guides than single timings.
 
 ## Testing
 
