@@ -1269,7 +1269,10 @@ struct Comps<K> {
 /// some ID does not fit K.
 fn link_components<'a, K: Key<'a>>(inp: &Inputs<'a>, target: usize, threads: usize) -> Option<Comps<K>> {
     let fail = AtomicBool::new(false);
-    let ln_chunks = make_chunks(&inp.links, target);
+    // The link files are small next to the events, so they get their own,
+    // smaller chunks: about 16 per thread, whatever the event chunk size.
+    let ln_bytes: usize = inp.links.iter().map(|b| b.len()).sum();
+    let ln_chunks = make_chunks(&inp.links, (ln_bytes / (threads * 16)).clamp(64 << 10, target));
     let pairs: Vec<Vec<(K, K)>> = ln_chunks
         .par_iter()
         .map(|c| {

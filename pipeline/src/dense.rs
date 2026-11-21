@@ -654,8 +654,14 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
     });
     drop(root_p);
     let omap: FxHashMap<u64, u32> = classified.iter().flat_map(|(_, o)| o.iter().copied()).collect();
-    let mut nodes: Vec<(u32, u32)> = classified.into_iter().flat_map(|(n, _)| n).collect();
-    nodes.par_sort_unstable();
+    // Every linked dense ID with its root, sorted by ID (so by person): packed
+    // into u64 keys, flattened and sorted on all threads.
+    let mut keys: Vec<u64> =
+        classified.par_iter().flat_map_iter(|(n, _)| n.iter().map(|&(v, r)| (v as u64) << 32 | r as u64)).collect();
+    drop(classified);
+    keys.par_sort_unstable();
+    let nodes: Vec<(u32, u32)> = keys.par_iter().map(|&k| ((k >> 32) as u32, k as u32)).collect();
+    drop(keys);
     // pinfo[p]: P_NONE (no linked alias), root << 32 | mask of linked aliases
     // (all < 32, all in one root that is not complex), or P_COMPLEX (whose
     // linked aliases are then in cmap).
