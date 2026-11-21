@@ -24,6 +24,7 @@ use memmap2::{Advice, Mmap};
 // zero fresh pages: 497k page faults per 20M-event run with glibc, 16k with this.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+mod dense;
 mod pq;
 use pq::{Column, GROUP_ROWS, Kind};
 use rayon::prelude::*;
@@ -809,6 +810,14 @@ fn main() {
     };
     // KEYS=128 or KEYS=slice skips the smaller key types (to test the fallbacks).
     let keys = std::env::var("KEYS").unwrap_or_default();
+    // The fast path for generator-shaped data, unless DENSE=off; DENSE=force
+    // takes it even when the data does not look generated (for tests). It
+    // exits the process when it succeeds.
+    let dense = std::env::var("DENSE").unwrap_or_default();
+    if keys.is_empty() && dense != "off" {
+        dense::run(t0, &out, &inp, threads, dense == "force");
+        log(t0, "fast path not taken");
+    }
     let done = (keys.is_empty() && run::<u64>(t0, &out, &inp, threads))
         || (keys != "slice" && {
             log(t0, "using 128-bit keys");
@@ -820,81 +829,107 @@ fn main() {
     }
 }
 
-/// The whole pipeline with key type K. Returns false, having written nothing,
-/// if some ID does not fit K.
-fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize) -> bool {
-    let (ws, we) = (inp.ws, inp.we);
-    let fail = AtomicBool::new(false);
+/// Products and campaigns, read once.
+struct Catalog<'a, K> {
+    /// Category names in byte order, "unknown" included; a category's rank is
+    /// its index here, so "smallest name wins a tie" becomes "smallest rank wins".
+    cat_names: Vec<&'a [u8]>,
+    ncat: usize,
+    unknown: u32,
+    products: FxHashMap<K, u32>,
+    /// Canonical `p<digits>` IDs by number (u32::MAX = not a product); empty if unusable.
+    prod_arr: Vec<u32>,
+    /// (key, campaign_id, channel), in file order; a campaign's index is its place here.
+    camp_rows: Vec<(K, &'a [u8], &'a [u8])>,
+    campaigns: FxHashMap<K, u32>,
+    ncamp: usize,
+}
 
-    // ---- Products -> category rank. Ranks follow byte order of the names,
-    // so "smallest name wins a tie" becomes "smallest rank wins".
-    let mut prod_rows: Vec<(K, &[u8])> = Vec::new();
-    let pb = inp.products;
-    scan::<2, _>(pb, true, |fl| match K::make(pb, fl[0].s, fl[0].e) {
-        Some(k) => prod_rows.push((k, &pb[fl[1].s..fl[1].e])),
-        None => fail.store(true, Relaxed),
-    });
-    let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
-    cat_names.push(b"unknown");
-    cat_names.sort_unstable();
-    cat_names.dedup();
-    let cat_rank: FxHashMap<&[u8], u32> = cat_names.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
-    let unknown = cat_rank[&b"unknown"[..]];
-    let products: FxHashMap<K, u32> = prod_rows.iter().map(|r| (r.0, cat_rank[r.1])).collect();
-    let ncat = cat_names.len();
-    // Canonical `p<digits>` IDs also go in an array by number (u32::MAX = not a product).
-    // An event's product field in that form is looked up there and only there; any
-    // other form falls back to the map, which holds every product.
-    let mut prod_arr: Vec<u32> = Vec::new();
-    {
-        let mut raw = Vec::new();
-        scan::<2, _>(pb, true, |fl| raw.push((product_number(&pb[fl[0].s..fl[0].e]), &pb[fl[1].s..fl[1].e])));
-        let max = raw.iter().filter_map(|r| r.0).max().unwrap_or(0);
-        if max < (1 << 20) {
-            prod_arr = vec![u32::MAX; max + 1];
-            for (n, c) in raw {
-                if let Some(n) = n {
-                    prod_arr[n] = cat_rank[c];
+impl<'a, K: Key<'a>> Catalog<'a, K> {
+    /// None if some product or campaign ID does not fit K.
+    fn load(inp: &Inputs<'a>) -> Option<Self> {
+        let mut ok = true;
+        let mut prod_rows: Vec<(K, &[u8])> = Vec::new();
+        let pb = inp.products;
+        scan::<2, _>(pb, true, |fl| match K::make(pb, fl[0].s, fl[0].e) {
+            Some(k) => prod_rows.push((k, &pb[fl[1].s..fl[1].e])),
+            None => ok = false,
+        });
+        let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
+        cat_names.push(b"unknown");
+        cat_names.sort_unstable();
+        cat_names.dedup();
+        let cat_rank: FxHashMap<&[u8], u32> = cat_names.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+        let unknown = cat_rank[&b"unknown"[..]];
+        let products: FxHashMap<K, u32> = prod_rows.iter().map(|r| (r.0, cat_rank[r.1])).collect();
+        let ncat = cat_names.len();
+        // An event's product field in canonical `p<digits>` form is looked up in the
+        // array and only there; any other form falls back to the map, which holds
+        // every product.
+        let mut prod_arr: Vec<u32> = Vec::new();
+        {
+            let mut raw = Vec::new();
+            scan::<2, _>(pb, true, |fl| raw.push((product_number(&pb[fl[0].s..fl[0].e]), &pb[fl[1].s..fl[1].e])));
+            let max = raw.iter().filter_map(|r| r.0).max().unwrap_or(0);
+            if max < (1 << 20) {
+                prod_arr = vec![u32::MAX; max + 1];
+                for (n, c) in raw {
+                    if let Some(n) = n {
+                        prod_arr[n] = cat_rank[c];
+                    }
                 }
             }
         }
+        let mut camp_rows: Vec<(K, &[u8], &[u8])> = Vec::new();
+        let cb = inp.campaigns;
+        scan::<2, _>(cb, true, |fl| match K::make(cb, fl[0].s, fl[0].e) {
+            Some(k) => camp_rows.push((k, &cb[fl[0].s..fl[0].e], &cb[fl[1].s..fl[1].e])),
+            None => ok = false,
+        });
+        let campaigns: FxHashMap<K, u32> = camp_rows.iter().enumerate().map(|(i, r)| (r.0, i as u32)).collect();
+        let ncamp = camp_rows.len();
+        ok.then_some(Catalog { cat_names, ncat, unknown, products, prod_arr, camp_rows, campaigns, ncamp })
     }
-    let use_arr = !prod_arr.is_empty();
-    let category_of = |d: &'a [u8], f: Fd| -> u32 {
+
+    #[inline(always)]
+    fn category_of(&self, d: &'a [u8], f: Fd) -> u32 {
         let s = &d[f.s..f.e];
-        if use_arr {
+        if !self.prod_arr.is_empty() {
             if let Some(n) = product_number(s) {
-                return match prod_arr.get(n) {
+                return match self.prod_arr.get(n) {
                     Some(&c) if c != u32::MAX => c,
-                    _ => unknown,
+                    _ => self.unknown,
                 };
             }
         }
         // A product ID that does not fit K is not in products.csv (all of those fit).
-        K::make(d, f.s, f.e).and_then(|p| products.get(&p).copied()).unwrap_or(unknown)
-    };
-
-    // ---- Campaigns.
-    let mut camp_rows: Vec<(K, &[u8], &[u8])> = Vec::new();
-    let cb = inp.campaigns;
-    scan::<2, _>(cb, true, |fl| match K::make(cb, fl[0].s, fl[0].e) {
-        Some(k) => camp_rows.push((k, &cb[fl[0].s..fl[0].e], &cb[fl[1].s..fl[1].e])),
-        None => fail.store(true, Relaxed),
-    });
-    let campaigns: FxHashMap<K, u32> = camp_rows.iter().enumerate().map(|(i, r)| (r.0, i as u32)).collect();
-    let ncamp = camp_rows.len();
-    let organic = ncamp; // index of "organic"
-    if fail.load(Relaxed) {
-        return false;
+        K::make(d, f.s, f.e).and_then(|p| self.products.get(&p).copied()).unwrap_or(self.unknown)
     }
+}
 
+/// About 32 chunks per thread, at most 16 MB each, so the last chunks of a
+/// phase are small and threads finish together (at 60M events a 64 MB cap
+/// left 143 chunks of ~45 MB).
+fn chunk_target(inp: &Inputs, threads: usize) -> usize {
     let total: usize = inp.events.iter().chain(&inp.clicks).map(|b| b.len()).sum();
-    // About 32 chunks per thread, at most 16 MB each, so the last chunks of a
-    // phase are small and threads finish together (at 60M events a 64 MB cap
-    // left 143 chunks of ~45 MB).
-    let target = (total / (threads * 32)).clamp(256 << 10, 16 << 20);
+    (total / (threads * 32)).clamp(256 << 10, 16 << 20)
+}
 
-    // ---- Links: union-find, person named by the byte-wise smallest ID.
+/// Linked IDs, numbered: `keys[s]` are hash shard s's distinct IDs, ID j of
+/// shard s has global index `base[s] + j`, `roots[i]` is index i's person (the
+/// smallest index in it), and `name[root]` that person's name: its byte-wise
+/// smallest ID.
+struct Comps<K> {
+    keys: Vec<Vec<K>>,
+    base: Vec<u32>,
+    roots: Vec<u32>,
+    name: Vec<Option<K>>,
+}
+
+/// Links: union-find, each person named by the byte-wise smallest ID. None if
+/// some ID does not fit K.
+fn link_components<'a, K: Key<'a>>(inp: &Inputs<'a>, target: usize, threads: usize) -> Option<Comps<K>> {
+    let fail = AtomicBool::new(false);
     let ln_chunks = make_chunks(&inp.links, target);
     let pairs: Vec<Vec<(K, K)>> = ln_chunks
         .par_iter()
@@ -914,7 +949,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         })
         .collect();
     if fail.load(Relaxed) {
-        return false;
+        return None;
     }
     // Number the distinct IDs: shard every occurrence by hash, and number each
     // shard on its own thread. Global index = shard base + index in the shard.
@@ -1014,12 +1049,32 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             }
         }
     });
+    let keys = id_shards.into_iter().map(|(k, _)| k).collect();
+    Some(Comps { keys, base, roots, name })
+}
+
+/// The whole pipeline with key type K. Returns false, having written nothing,
+/// if some ID does not fit K.
+fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize) -> bool {
+    let (ws, we) = (inp.ws, inp.we);
+    let fail = AtomicBool::new(false);
+    let Some(cat) = Catalog::<K>::load(inp) else { return false };
+    let Catalog { ref cat_names, ncat, ref campaigns, ncamp, ref camp_rows, .. } = cat;
+    let category_of = |d: &'a [u8], f: Fd| cat.category_of(d, f);
+    let organic = ncamp; // index of "organic"
+    let target = chunk_target(inp, threads);
+
+    // ---- Links.
+    let Some(Comps { keys: id_keys, base, roots, name }) = link_components::<K>(inp, target, threads) else {
+        return false;
+    };
+    let nid = roots.len();
     // ID -> name, only for IDs that are not their person's name, sharded like the
     // IDs (by the top 8 bits of `mix`), each shard its own table, built in parallel.
-    let links: Vec<LinkTable<K>> = id_shards
+    let links: Vec<LinkTable<K>> = id_keys
         .par_iter()
         .enumerate()
-        .map(|(s, (keys, _))| {
+        .map(|(s, keys)| {
             let entries: Vec<(K, K)> = keys
                 .iter()
                 .enumerate()
@@ -1031,7 +1086,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             LinkTable::new(&entries)
         })
         .collect();
-    drop(id_shards);
+    drop(id_keys);
     drop(name);
     drop(roots);
     log(t0, &format!("links: {nid} ids"));
@@ -1343,12 +1398,7 @@ struct Scratch<K> {
     cpid: Vec<u32>,
     cl_off: Vec<usize>,
     cls: Vec<Cl<K>>,
-    catsum: Vec<u64>,
-    touched: Vec<u32>,
-    starts: Vec<i64>,
-    sdays: Vec<u32>,
-    run_end: Vec<u32>,
-    pairs: Vec<(u32, i64)>,
+    ps: PScratch,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1382,12 +1432,7 @@ fn process_shard<'a, K: Key<'a>>(
         cpid,
         cl_off,
         cls,
-        catsum,
-        touched,
-        starts,
-        sdays,
-        run_end,
-        pairs,
+        ps,
     } = sc;
     index.clear();
     index.reserve(n_ev / 8 + 16);
@@ -1471,134 +1516,169 @@ fn process_shard<'a, K: Key<'a>>(
             }
         }
     }
-    catsum.clear();
-    catsum.resize(ncat, 0);
-    touched.clear();
-
+    ps.reset(ncat);
     for pid in 0..np {
         let ev = &mut evs[ev_off[pid]..ev_off[pid + 1]];
-        ev.sort_unstable_by_key(|e| e.ts);
         let cl = &mut cls[cl_off[pid]..cl_off[pid + 1]];
-        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
-        let n = ev.len();
-        let m = cl.len();
-        starts.clear();
-        sdays.clear();
+        person(ev, cl, names[pid], day0, organic, ndays, ps, urows, camp);
+    }
+}
 
-        let mut cur_day = u32::MAX;
-        let (mut u_sess, mut u_ev, mut u_rev) = (0i64, 0i64, 0i64);
-        let flush = |day: u32, s: i64, e: i64, r: i64, catsum: &mut [u64], touched: &mut Vec<u32>, urows: &mut Vec<URow<K>>| {
-            let mut top: Option<u32> = None;
-            let mut best = 0u64;
-            for &c in touched.iter() {
-                let v = catsum[c as usize];
-                if top.is_none() || v > best || (v == best && c < top.unwrap()) {
-                    top = Some(c);
-                    best = v;
-                }
-                catsum[c as usize] = 0;
+/// Per-person scratch, reused from person to person.
+#[derive(Default)]
+struct PScratch {
+    catsum: Vec<u64>,
+    touched: Vec<u32>,
+    starts: Vec<i64>,
+    sdays: Vec<u32>,
+    run_end: Vec<u32>,
+    pairs: Vec<(u32, i64)>,
+}
+
+impl PScratch {
+    fn reset(&mut self, ncat: usize) {
+        self.catsum.clear();
+        self.catsum.resize(ncat, 0);
+        self.touched.clear();
+    }
+}
+
+/// One person's events and clicks (any order) -> their user_daily rows and
+/// campaign counters. `camp[c * ndays + day]` = [sessions, purchasing, revenue, assisted].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn person<K: Copy + Ord>(
+    ev: &mut [Ev],
+    cl: &mut [Cl<K>],
+    name: K,
+    day0: i64,
+    organic: usize,
+    ndays: usize,
+    ps: &mut PScratch,
+    urows: &mut Vec<URow<K>>,
+    camp: &mut [[i64; 4]],
+) {
+    let PScratch { catsum, touched, starts, sdays, run_end, pairs } = ps;
+    ev.sort_unstable_by_key(|e| e.ts);
+    cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+    let n = ev.len();
+    let m = cl.len();
+    starts.clear();
+    sdays.clear();
+
+    let mut cur_day = u32::MAX;
+    let (mut u_sess, mut u_ev, mut u_rev) = (0i64, 0i64, 0i64);
+    let flush = |day: u32, s: i64, e: i64, r: i64, catsum: &mut [u64], touched: &mut Vec<u32>, urows: &mut Vec<URow<K>>| {
+        let mut top: Option<u32> = None;
+        let mut best = 0u64;
+        for &c in touched.iter() {
+            let v = catsum[c as usize];
+            if top.is_none() || v > best || (v == best && c < top.unwrap()) {
+                top = Some(c);
+                best = v;
             }
-            touched.clear();
-            urows.push(URow { name: names[pid], day: (day0 + day as i64) as i32, sessions: s, events: e, revenue: r, top });
+            catsum[c as usize] = 0;
+        }
+        touched.clear();
+        urows.push(URow { name, day: (day0 + day as i64) as i32, sessions: s, events: e, revenue: r, top });
+    };
+
+    let (mut hi, mut run_start) = (0usize, 0usize);
+    let mut i = 0usize;
+    while i < n {
+        let s = ev[i].ts;
+        let mut j = i + 1;
+        while j < n && ev[j].ts - ev[j - 1].ts <= GAP {
+            j += 1;
+        }
+        let day = (s.div_euclid(DAY) - day0) as u32;
+        let mut rev = 0i64;
+        let mut purchased = false;
+        if day != cur_day {
+            if cur_day != u32::MAX {
+                flush(cur_day, u_sess, u_ev, u_rev, catsum, touched, urows);
+            }
+            cur_day = day;
+            u_sess = 0;
+            u_ev = 0;
+            u_rev = 0;
+        }
+        for e in &ev[i..j] {
+            if e.price > 0 {
+                purchased = true;
+                rev += e.price as i64;
+                let c = e.cat as usize;
+                if catsum[c] == 0 {
+                    touched.push(e.cat);
+                }
+                catsum[c] += e.price as u64;
+            }
+        }
+        u_sess += 1;
+        u_ev += (j - i) as i64;
+        u_rev += rev;
+
+        // Credit: latest click with ts <= start and start - ts <= 7 days; tie -> smallest click_id.
+        while hi < m && cl[hi].ts <= s {
+            if hi == 0 || cl[hi].ts != cl[hi - 1].ts {
+                run_start = hi;
+            }
+            hi += 1;
+        }
+        let c = if hi > 0 && cl[hi - 1].ts >= s - WEEK { cl[run_start].camp as usize } else { organic };
+        let slot = &mut camp[c * ndays + day as usize];
+        slot[0] += 1;
+        slot[1] += purchased as i64;
+        slot[2] += rev;
+
+        starts.push(s);
+        sdays.push(day);
+        i = j;
+    }
+    if cur_day != u32::MAX {
+        flush(cur_day, u_sess, u_ev, u_rev, catsum, touched, urows);
+    }
+
+    // Assists: campaign c assists session S iff some click t of c has t <= S <= t + 7d.
+    // Merge each campaign's [t, t+7d] intervals, then count sessions per day inside them.
+    if m > 0 {
+        let ns = starts.len();
+        run_end.clear();
+        run_end.resize(ns, 0);
+        for k in (0..ns).rev() {
+            run_end[k] = if k + 1 < ns && sdays[k + 1] == sdays[k] { run_end[k + 1] } else { (k + 1) as u32 };
+        }
+        pairs.clear();
+        pairs.extend(cl.iter().map(|c| (c.camp, c.ts)));
+        pairs.sort_unstable();
+        let mut add = |c: u32, a: i64, b: i64| {
+            let lo = starts.partition_point(|&x| x < a);
+            let hi = starts.partition_point(|&x| x <= b);
+            let mut k = lo;
+            while k < hi {
+                let e = (run_end[k] as usize).min(hi);
+                camp[c as usize * ndays + sdays[k] as usize][3] += (e - k) as i64;
+                k = e;
+            }
         };
-
-        let (mut hi, mut run_start) = (0usize, 0usize);
-        let mut i = 0usize;
-        while i < n {
-            let s = ev[i].ts;
-            let mut j = i + 1;
-            while j < n && ev[j].ts - ev[j - 1].ts <= GAP {
-                j += 1;
-            }
-            let day = (s.div_euclid(DAY) - day0) as u32;
-            let mut rev = 0i64;
-            let mut purchased = false;
-            if day != cur_day {
-                if cur_day != u32::MAX {
-                    flush(cur_day, u_sess, u_ev, u_rev, catsum, touched, urows);
+        let mut q = 0;
+        while q < pairs.len() {
+            let c = pairs[q].0;
+            let mut a = pairs[q].1;
+            let mut b = a + WEEK;
+            q += 1;
+            while q < pairs.len() && pairs[q].0 == c {
+                let t = pairs[q].1;
+                if t <= b {
+                    b = t + WEEK;
+                } else {
+                    add(c, a, b);
+                    a = t;
+                    b = t + WEEK;
                 }
-                cur_day = day;
-                u_sess = 0;
-                u_ev = 0;
-                u_rev = 0;
-            }
-            for e in &ev[i..j] {
-                if e.price > 0 {
-                    purchased = true;
-                    rev += e.price as i64;
-                    let c = e.cat as usize;
-                    if catsum[c] == 0 {
-                        touched.push(e.cat);
-                    }
-                    catsum[c] += e.price as u64;
-                }
-            }
-            u_sess += 1;
-            u_ev += (j - i) as i64;
-            u_rev += rev;
-
-            // Credit: latest click with ts <= start and start - ts <= 7 days; tie -> smallest click_id.
-            while hi < m && cl[hi].ts <= s {
-                if hi == 0 || cl[hi].ts != cl[hi - 1].ts {
-                    run_start = hi;
-                }
-                hi += 1;
-            }
-            let c = if hi > 0 && cl[hi - 1].ts >= s - WEEK { cl[run_start].camp as usize } else { organic };
-            let slot = &mut camp[c * ndays + day as usize];
-            slot[0] += 1;
-            slot[1] += purchased as i64;
-            slot[2] += rev;
-
-            starts.push(s);
-            sdays.push(day);
-            i = j;
-        }
-        if cur_day != u32::MAX {
-            flush(cur_day, u_sess, u_ev, u_rev, catsum, touched, urows);
-        }
-
-        // Assists: campaign c assists session S iff some click t of c has t <= S <= t + 7d.
-        // Merge each campaign's [t, t+7d] intervals, then count sessions per day inside them.
-        if m > 0 {
-            let ns = starts.len();
-            run_end.clear();
-            run_end.resize(ns, 0);
-            for k in (0..ns).rev() {
-                run_end[k] = if k + 1 < ns && sdays[k + 1] == sdays[k] { run_end[k + 1] } else { (k + 1) as u32 };
-            }
-            pairs.clear();
-            pairs.extend(cl.iter().map(|c| (c.camp, c.ts)));
-            pairs.sort_unstable();
-            let mut add = |c: u32, a: i64, b: i64| {
-                let lo = starts.partition_point(|&x| x < a);
-                let hi = starts.partition_point(|&x| x <= b);
-                let mut k = lo;
-                while k < hi {
-                    let e = (run_end[k] as usize).min(hi);
-                    camp[c as usize * ndays + sdays[k] as usize][3] += (e - k) as i64;
-                    k = e;
-                }
-            };
-            let mut q = 0;
-            while q < pairs.len() {
-                let c = pairs[q].0;
-                let mut a = pairs[q].1;
-                let mut b = a + WEEK;
                 q += 1;
-                while q < pairs.len() && pairs[q].0 == c {
-                    let t = pairs[q].1;
-                    if t <= b {
-                        b = t + WEEK;
-                    } else {
-                        add(c, a, b);
-                        a = t;
-                        b = t + WEEK;
-                    }
-                    q += 1;
-                }
-                add(c, a, b);
             }
+            add(c, a, b);
         }
     }
 }
