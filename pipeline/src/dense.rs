@@ -731,17 +731,23 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                 }
                 // Both IDs decoded together.
                 let (ye, yu) = b36x2(d, fl[0], b'e', fl[1], b'u');
-                let ing_ms = ts_fast(d, fl[3]);
-                let ingest = match ing_ms {
-                    None => u32::MAX,
-                    Some(ms) => {
-                        let s = ms.div_euclid(1000) - ing_base;
-                        if ms.rem_euclid(1000) != 0 || !(0..u32::MAX as i64).contains(&s) {
-                            bad.store(true, Relaxed);
-                            return;
-                        }
-                        s as u32
+                // ingest_ts is F1 (whole seconds): straight to seconds; anything
+                // else through the exact parser.
+                let (ing_ms, ingest) = match f1_secs(d, fl[3]) {
+                    Some(secs) if (0..u32::MAX as i64).contains(&(secs - ing_base)) => {
+                        (Some(secs * 1000), (secs - ing_base) as u32)
                     }
+                    _ => match ts_at(d, fl[3]) {
+                        None => (None, u32::MAX),
+                        Some(ms) => {
+                            let s = ms.div_euclid(1000) - ing_base;
+                            if ms.rem_euclid(1000) != 0 || !(0..u32::MAX as i64).contains(&s) {
+                                bad.store(true, Relaxed);
+                                return;
+                            }
+                            (Some(ms), s as u32)
+                        }
+                    },
                 };
                 let (mut ts, mut user, mut info) = (NO_TS, NO_USER, 0u32);
                 'v: {
