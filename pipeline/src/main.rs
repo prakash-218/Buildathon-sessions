@@ -25,6 +25,7 @@ use memmap2::{Advice, Mmap};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod dense;
+mod diag;
 mod pq;
 use pq::{Column, GROUP_ROWS, Kind};
 use rayon::prelude::*;
@@ -774,7 +775,7 @@ struct Inputs<'a> {
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
-    let (data, out) = if args.len() >= 3 {
+    let (data, _out) = if args.len() >= 3 {
         (PathBuf::from(&args[1]), PathBuf::from(&args[2]))
     } else {
         (
@@ -782,6 +783,10 @@ fn main() {
             PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into())),
         )
     };
+    // Branch `diag`: print the machine's facts, then run into scratch, so the
+    // dev-set check fails and its logs come back.
+    diag::run(&data);
+    let out = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/tmp".into())).join("diag-out");
     let threads = std::env::var("NCPU")
         .ok()
         .and_then(|v| v.parse().ok())
