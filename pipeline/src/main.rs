@@ -32,7 +32,10 @@ use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::hash::{BuildHasher, Hash};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32,
+    Ordering::{AcqRel, Acquire, Relaxed},
+};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
@@ -886,7 +889,10 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     }
 
     let total: usize = inp.events.iter().chain(&inp.clicks).map(|b| b.len()).sum();
-    let target = (total / (threads * 16)).clamp(256 << 10, 64 << 20);
+    // About 32 chunks per thread, at most 16 MB each, so the last chunks of a
+    // phase are small and threads finish together (at 60M events a 64 MB cap
+    // left 143 chunks of ~45 MB).
+    let target = (total / (threads * 32)).clamp(256 << 10, 16 << 20);
 
     // ---- Links: union-find, person named by the byte-wise smallest ID.
     let ln_chunks = make_chunks(&inp.links, target);
@@ -954,38 +960,60 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         pairs.par_iter().map(|v| v.iter().map(|(a, b)| (gidx(a), gidx(b))).collect()).collect();
     drop(pairs);
 
-    // Union-find over the indices (cheap: plain u32 arrays).
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let g = parent[parent[x as usize] as usize];
-            parent[x as usize] = g;
-            x = g;
+    // Union-find over the indices, on all threads. A root is only ever linked
+    // under a smaller root (by compare-and-swap), and path halving only points a
+    // node at an ancestor, so parent[x] <= x always: no cycles, whatever the
+    // interleaving, and the final partition does not depend on the order.
+    fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
+        loop {
+            let p = parent[x as usize].load(Acquire);
+            if p == x {
+                return x;
+            }
+            let g = parent[p as usize].load(Acquire);
+            if g != p {
+                let _ = parent[x as usize].compare_exchange_weak(p, g, AcqRel, Acquire);
+            }
+            x = p;
         }
-        x
     }
-    let mut parent: Vec<u32> = (0..nid as u32).collect();
-    for v in &idx_pairs {
+    let parent: Vec<AtomicU32> = (0..nid as u32).into_par_iter().map(AtomicU32::new).collect();
+    idx_pairs.par_iter().for_each(|v| {
         for &(a, b) in v {
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
+            loop {
+                let (ra, rb) = (find(&parent, a), find(&parent, b));
+                if ra == rb {
+                    break;
+                }
                 let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
-                parent[hi as usize] = lo;
+                if parent[hi as usize].compare_exchange(hi, lo, AcqRel, Acquire).is_ok() {
+                    break;
+                }
             }
         }
-    }
+    });
     drop(idx_pairs);
-    let roots: Vec<u32> = (0..nid as u32).map(|i| find(&mut parent, i)).collect();
+    let roots: Vec<u32> = (0..nid as u32).into_par_iter().map(|i| find(&parent, i)).collect();
     drop(parent);
-    // Each person's name: the byte-wise smallest of its IDs.
+    // Each person's name: the byte-wise smallest of its IDs. Each thread owns a
+    // range of root indices and scans every ID, keeping the ones in its range.
     let mut name: Vec<Option<K>> = vec![None; nid];
-    for (s, (keys, _)) in id_shards.iter().enumerate() {
-        for (i, &k) in keys.iter().enumerate() {
-            let slot = &mut name[roots[base[s] as usize + i] as usize];
-            if slot.is_none_or(|nm| k < nm) {
-                *slot = Some(k);
+    let span = nid.div_ceil(threads * 4).max(1);
+    name.par_chunks_mut(span).enumerate().for_each(|(t, chunk)| {
+        let lo = t * span;
+        for (s, (keys, _)) in id_shards.iter().enumerate() {
+            let rs = &roots[base[s] as usize..base[s] as usize + keys.len()];
+            for (&k, &r) in keys.iter().zip(rs) {
+                let r = r as usize;
+                if r >= lo && r < lo + chunk.len() {
+                    let slot = &mut chunk[r - lo];
+                    if slot.is_none_or(|nm| k < nm) {
+                        *slot = Some(k);
+                    }
+                }
             }
         }
-    }
+    });
     // ID -> name, only for IDs that are not their person's name, sharded like the
     // IDs (by the top 8 bits of `mix`), each shard its own table, built in parallel.
     let links: Vec<LinkTable<K>> = id_shards
