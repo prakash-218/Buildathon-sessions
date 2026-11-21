@@ -300,36 +300,46 @@ fn block_masks(b: &[u8]) -> (u64, u64, u64) {
     (nl, cm, qt)
 }
 
+/// Bits `lo..hi` of a u64, for `0 <= lo <= hi <= 64`.
+#[inline(always)]
+fn bits_between(lo: usize, hi: usize) -> u64 {
+    let below = |x: usize| if x >= 64 { !0u64 } else { (1u64 << x) - 1 };
+    below(hi) & !below(lo)
+}
+
 /// Call `f` with the N fields of every well-formed line of `d`, under the CSV
 /// dialect: only '\n' ends a line, exactly N fields, quotes only around a whole
 /// field (and nowhere inside it). Malformed and empty lines are skipped, and so
 /// is the first line when `skip_first` (the file's header).
 #[inline(always)]
 #[allow(unused_assignments)] // the macros' resets after the last line
+///
+/// Only commas and newlines are stepped through (a regular pattern the branch
+/// predictor learns); quotes are counted per field with a popcount. A field is
+/// valid with no quote at all, or with exactly two that are its first and last
+/// byte (then nothing between them can be a quote).
 fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F) {
     let n = d.len();
     let mut fl = [Fd::default(); N];
     let mut k = 0usize; // index of the current field
     let mut fstart = 0usize; // start of the current field
-    let (mut qcnt, mut qfirst, mut qlast) = (0u32, 0usize, 0usize); // quotes in the current field
+    let mut qcnt = 0u32; // quotes of the current field in blocks already passed
     let mut bad = false;
     let mut skip = skip_first;
 
     macro_rules! end_field {
-        ($pos:expr) => {{
-            let pos: usize = $pos;
-            if !bad {
-                if k < N {
-                    if qcnt == 0 {
-                        fl[k] = Fd { s: fstart, e: pos };
-                    } else if qcnt == 2 && qfirst == fstart && qlast + 1 == pos {
-                        fl[k] = Fd { s: fstart + 1, e: pos - 1 };
-                    } else {
-                        bad = true;
-                    }
+        ($pos:expr, $qc:expr) => {{
+            let (pos, qc): (usize, u32) = ($pos, $qc);
+            if k < N {
+                if qc == 0 {
+                    fl[k] = Fd { s: fstart, e: pos };
+                } else if qc == 2 && pos >= fstart + 2 && d[fstart] == b'"' && d[pos - 1] == b'"' {
+                    fl[k] = Fd { s: fstart + 1, e: pos - 1 };
                 } else {
-                    bad = true; // too many fields
+                    bad = true;
                 }
+            } else {
+                bad = true; // too many fields
             }
             k += 1;
             qcnt = 0;
@@ -357,29 +367,24 @@ fn scan<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F
             _mm_prefetch::<_MM_HINT_T0>(d.as_ptr().wrapping_add(base + 1024) as *const i8);
         }
         let (nl, cm, qt) = masks(d, base);
-        let mut s = nl | cm | qt;
+        let mut s = nl | cm;
         while s != 0 {
-            let bit = s.trailing_zeros();
+            let bit = s.trailing_zeros() as usize;
             s &= s - 1;
-            let m = 1u64 << bit;
-            let pos = base + bit as usize;
-            if qt & m != 0 {
-                if qcnt == 0 {
-                    qfirst = pos;
-                }
-                qlast = pos;
-                qcnt += 1;
-            } else {
-                end_field!(pos);
-                if nl & m != 0 {
-                    end_line!();
-                }
+            let pos = base + bit;
+            // Quotes in [fstart, pos): earlier blocks' count plus this block's bits.
+            let qc = qcnt + (qt & bits_between(fstart.saturating_sub(base), bit)).count_ones();
+            end_field!(pos, qc);
+            if (nl >> bit) & 1 != 0 {
+                end_line!();
             }
         }
+        // The open field's quotes in this block carry over to the next.
+        qcnt += (qt & bits_between(fstart.saturating_sub(base).min(64), 64)).count_ones();
         base += 64;
     }
     if k > 0 || fstart < n {
-        end_field!(n); // a last line with no '\n'
+        end_field!(n, qcnt); // a last line with no '\n'
         end_line!();
     }
 }
@@ -1728,5 +1733,122 @@ mod tests {
         assert!(parse_ts(b"2026-02-29T00:00:00Z").is_none());
         assert!(parse_ts(b"2026-10-03T23:58:10+0200").is_none());
         assert!(parse_ts(b"2026-10-03 23:58:10Z").is_none());
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// The previous scanner, which steps through every quote too. It defines the
+    /// semantics the new one must reproduce exactly.
+    #[allow(unused_assignments)]
+    fn scan_ref<const N: usize, F: FnMut(&[Fd; N])>(d: &[u8], skip_first: bool, mut f: F) {
+        let n = d.len();
+        let mut fl = [Fd::default(); N];
+        let (mut k, mut fstart) = (0usize, 0usize);
+        let (mut qcnt, mut qfirst, mut qlast) = (0u32, 0usize, 0usize);
+        let (mut bad, mut skip) = (false, skip_first);
+        macro_rules! end_field {
+            ($pos:expr) => {{
+                let pos: usize = $pos;
+                if !bad {
+                    if k < N {
+                        if qcnt == 0 {
+                            fl[k] = Fd { s: fstart, e: pos };
+                        } else if qcnt == 2 && qfirst == fstart && qlast + 1 == pos {
+                            fl[k] = Fd { s: fstart + 1, e: pos - 1 };
+                        } else {
+                            bad = true;
+                        }
+                    } else {
+                        bad = true;
+                    }
+                }
+                k += 1;
+                qcnt = 0;
+                fstart = pos + 1;
+            }};
+        }
+        macro_rules! end_line {
+            () => {{
+                if !bad && k == N && !skip {
+                    f(&fl);
+                }
+                skip = false;
+                bad = false;
+                k = 0;
+            }};
+        }
+        for (pos, &c) in d.iter().enumerate() {
+            match c {
+                b'"' => {
+                    if qcnt == 0 {
+                        qfirst = pos;
+                    }
+                    qlast = pos;
+                    qcnt += 1;
+                }
+                b',' => end_field!(pos),
+                b'\n' => {
+                    end_field!(pos);
+                    end_line!();
+                }
+                _ => {}
+            }
+        }
+        if k > 0 || fstart < n {
+            end_field!(n);
+            end_line!();
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn collect<const N: usize>(d: &[u8], skip: bool, new: bool) -> Vec<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        let mut push = |fl: &[Fd; N]| out.push(fl.iter().map(|f| (f.s, f.e)).collect());
+        if new { scan::<N, _>(d, skip, &mut push) } else { scan_ref::<N, _>(d, skip, &mut push) }
+        out
+    }
+
+    #[test]
+    fn new_scanner_matches_the_reference() {
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let mut lines_seen = 0;
+        for case in 0..30_000 {
+            // Mostly well-formed-looking lines, with every kind of breakage mixed in.
+            let len = (r.next() % 700) as usize;
+            let quote_rate = [2, 8, 30][case % 3];
+            let d: Vec<u8> = (0..len)
+                .map(|_| match r.next() % 100 {
+                    x if x < quote_rate => b'"',
+                    x if x < 50 => b"abcxyz0129"[(r.next() % 10) as usize],
+                    x if x < 72 => b',',
+                    x if x < 80 => b'\n',
+                    x if x < 83 => b'\r',
+                    x if x < 86 => b' ',
+                    _ => b"-:TZ+."[(r.next() % 6) as usize],
+                })
+                .collect();
+            for skip in [false, true] {
+                let (a, b) = (collect::<2>(&d, skip, true), collect::<2>(&d, skip, false));
+                assert_eq!(a, b, "N=2 skip={skip} {:?}", String::from_utf8_lossy(&d));
+                let (a, b) = (collect::<4>(&d, skip, true), collect::<4>(&d, skip, false));
+                assert_eq!(a, b, "N=4 skip={skip} {:?}", String::from_utf8_lossy(&d));
+                let (a, b) = (collect::<7>(&d, skip, true), collect::<7>(&d, skip, false));
+                assert_eq!(a, b, "N=7 skip={skip} {:?}", String::from_utf8_lossy(&d));
+                lines_seen += a.len();
+            }
+        }
+        assert!(lines_seen > 1000, "the test should accept real lines too ({lines_seen})");
     }
 }
