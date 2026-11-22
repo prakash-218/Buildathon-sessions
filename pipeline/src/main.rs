@@ -34,7 +34,7 @@ use std::fs::File;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
-    AtomicBool, AtomicU32,
+    AtomicBool, AtomicU32, AtomicUsize,
     Ordering::{AcqRel, Acquire, Relaxed},
 };
 use std::time::Instant;
@@ -529,49 +529,64 @@ fn prefetch<T>(p: *const T) {
     }
 }
 
-/// ID -> person name, for the IDs that are not their person's own name. Open
-/// addressing with linear probing and (key, value) pairs side by side, so a
-/// lookup usually reads one cache line, whose address is known from the hash
-/// alone: callers prefetch it a few rows ahead. Empty slots hold
-/// `K::default()`, which no ID can equal (IDs are never empty).
+/// ID -> person name, for the IDs that are not their person's own name.
+/// Buckets of 4 (key, value) slots, at most a quarter full: a key goes in the
+/// first bucket from its hash's with room, so a lookup checks its bucket's 4
+/// slots with selects (no branch on found / not found, which is random) and
+/// only looks further when that bucket is full and lacks it (rare). Callers
+/// prefetch the bucket a few rows ahead. Empty slots hold `K::default()`,
+/// which no ID can equal (IDs are never empty).
 struct LinkTable<K> {
     slots: Vec<(K, K)>,
-    mask: usize,
+    mask: usize, // bucket count - 1
 }
 
 impl<'a, K: Key<'a>> LinkTable<K> {
     fn new(entries: &[(K, K)]) -> Self {
-        let cap = (entries.len() * 2 + 2).next_power_of_two().max(8); // load <= 1/2
-        let mask = cap - 1;
-        let mut slots = vec![(K::default(), K::default()); cap];
+        let nb = (entries.len() + 1).next_power_of_two().max(2); // 4 slots each: load <= 1/4
+        let mask = nb - 1;
+        let mut slots = vec![(K::default(), K::default()); nb * 4];
         for &(k, v) in entries {
-            let mut i = mix(&k) as usize & mask;
-            while slots[i].0 != K::default() {
-                i = (i + 1) & mask;
+            let mut b = mix(&k) as usize & mask;
+            'ins: loop {
+                for j in 0..4 {
+                    if slots[b * 4 + j].0 == K::default() {
+                        slots[b * 4 + j] = (k, v);
+                        break 'ins;
+                    }
+                }
+                b = (b + 1) & mask;
             }
-            slots[i] = (k, v);
         }
         LinkTable { slots, mask }
     }
 
     #[inline(always)]
     fn prefetch(&self, h: u64) {
-        prefetch(self.slots.as_ptr().wrapping_add(h as usize & self.mask));
+        let p = self.slots.as_ptr().wrapping_add((h as usize & self.mask) * 4);
+        prefetch(p);
+        prefetch(p.wrapping_add(3));
     }
 
     /// The name of `k` (whose `mix` is `h`): its entry, or `k` itself.
     #[inline(always)]
     fn get(&self, k: K, h: u64) -> K {
-        let mut i = h as usize & self.mask;
+        let mut b = h as usize & self.mask;
         loop {
-            let s = &self.slots[i];
-            if s.0 == k {
-                return s.1;
+            let sl = &self.slots[b * 4..b * 4 + 4];
+            let mut v = k;
+            let mut full = true;
+            for s in sl {
+                if s.0 == k {
+                    v = s.1;
+                }
+                full &= s.0 != K::default();
             }
-            if s.0 == K::default() {
-                return k;
+            // Entries map an ID to another, so v != k means found.
+            if v != k || !full {
+                return v;
             }
-            i = (i + 1) & self.mask;
+            b = (b + 1) & self.mask;
         }
     }
 }
@@ -1319,6 +1334,7 @@ fn f1_trusted(d: &[u8], f: Fd) -> Option<i64> {
 fn f1_trusted(d: &[u8], f: Fd) -> Option<i64> {
     f1_secs(d, f)
 }
+
 
 /// `ts_at`, with F1 by `f1_secs` first.
 #[inline(always)]
@@ -2413,16 +2429,20 @@ fn run_old<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: u
 
 // ------------------------------------------------- compact pipeline (main path)
 
-/// A valid event copy, written once at parse time into its person's shard:
-/// the person, ts - window_start (DEAD_TS once dedup keeps another copy of the
-/// event), and the purchase price (0 for view and cart). A purchase's category
-/// goes to a side list of its shard, in the same order.
+/// A valid event copy, written at parse time into its user ID's shard (and
+/// moved to its person's shard by the renaming pass if the ID is not the
+/// person's name): the ID or name, ts - window_start (DEAD_TS once dedup keeps
+/// another copy of the event, or once moved), and price | category << 24 (the
+/// price is 0 for view and cart, under 2^24 for purchases).
 #[derive(Clone, Copy)]
 struct Pay<K> {
     name: K,
     ts: u32,
-    price: u32,
+    pc: u32,
 }
+
+/// Clk::ts of a click the renaming pass moved to its person's shard.
+const MOVED_TS: u32 = u32::MAX;
 
 const DEAD_TS: u32 = u32::MAX;
 
@@ -2437,18 +2457,6 @@ struct Dup<K> {
 
 const NOLOC: u32 = u32::MAX;
 const LOC_BITS: u32 = 24;
-
-/// A valid event copy waiting AHEAD rows for its person lookup.
-#[derive(Clone, Copy, Default)]
-struct Pend<K> {
-    id: K,
-    uid: K,
-    h: u64,
-    ingest: u32,
-    ts: u32,
-    price: u32,
-    cat: u32,
-}
 
 /// A valid click: person, click ID, ts - (window_start - 7 days), campaign.
 #[derive(Clone, Copy, Default)]
@@ -2488,80 +2496,60 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let bail = AtomicBool::new(false); // a value the compact records cannot hold
     let Some(cat) = Catalog::<K>::load(inp) else { return false };
     let Catalog { ref cat_names, ncat, ncamp, ref camp_rows, .. } = cat;
-    if ncat > u16::MAX as usize {
-        return false;
+    if ncat > 256 {
+        return false; // the category must fit Pay::pc's top byte
     }
     let category_of = |d: &'a [u8], f: Fd| cat.category_of(d, f);
     let organic = ncamp; // index of "organic"
     let target = chunk_target(inp, threads);
 
-    // ---- Links.
-    let Some(Comps { keys: id_keys, base, roots, name }) = link_components::<K>(inp, target, threads) else {
-        return false;
+    // ---- Links: the events and clicks do not need them until the renaming
+    // pass, so they are worked out on the side (on the rayon pool) while the
+    // parsing below runs on its own threads.
+    let links_job = || -> Option<Vec<LinkTable<K>>> {
+        let Comps { keys: id_keys, base, roots, name } = link_components::<K>(inp, target, threads)?;
+        let nid = roots.len();
+        let links: Vec<LinkTable<K>> = id_keys
+            .par_iter()
+            .enumerate()
+            .map(|(s, keys)| {
+                let entries: Vec<(K, K)> = keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &k)| {
+                        let nm = name[roots[base[s] as usize + i] as usize].unwrap();
+                        (nm != k).then_some((k, nm))
+                    })
+                    .collect();
+                LinkTable::new(&entries)
+            })
+            .collect();
+        log(t0, &format!("links: {nid} ids"));
+        Some(links)
     };
-    let nid = roots.len();
-    let links: Vec<LinkTable<K>> = id_keys
-        .par_iter()
-        .enumerate()
-        .map(|(s, keys)| {
-            let entries: Vec<(K, K)> = keys
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &k)| {
-                    let nm = name[roots[base[s] as usize + i] as usize].unwrap();
-                    (nm != k).then_some((k, nm))
-                })
-                .collect();
-            LinkTable::new(&entries)
-        })
-        .collect();
-    drop(id_keys);
-    drop(name);
-    drop(roots);
-    log(t0, &format!("links: {nid} ids"));
-    let table_of = |h: u64| -> &LinkTable<K> { &links[(h >> 56) as usize & (NB - 1)] };
+    let links: Vec<LinkTable<K>>;
 
-    // ---- Events: parse every copy. A valid copy's payload is written once,
-    // straight into its person's shard; every copy also sends (id, ingest, where
-    // its payload is) to its event_id shard for dedup. One set of shard buffers
-    // per thread, so a payload's place is (thread, shard, index).
+    // ---- Events: parse every copy. A valid copy's payload goes to its user
+    // ID's shard, with no person lookup here (the renaming pass below moves the
+    // payloads of IDs that are not their person's name); every copy also sends
+    // (id, ingest, where its payload is) to its event_id shard for dedup. One
+    // set of shard buffers per thread, so a payload's place is (thread, shard,
+    // index).
+    let links_out = std::thread::scope(|scope| {
+    let links_handle = scope.spawn(links_job);
     let ev_chunks = make_chunks(&inp.events, target);
     let ev_bytes: usize = inp.events.iter().map(|b| b.len()).sum();
     let ev_cap = shard_cap(ev_bytes / threads, 72);
-    type EvT<K> = (Vec<Vec<Dup<K>>>, Vec<Vec<Pay<K>>>, Vec<Vec<u16>>);
+    type EvT<K> = (Vec<Vec<Dup<K>>>, Vec<Vec<Pay<K>>>);
     let ev_out: Vec<EvT<K>> = dense::per_thread(
         ev_chunks.len(),
         threads,
-        |_| {
-            (
-                (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
-                (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
-                (0..NB).map(|_| Vec::with_capacity(ev_cap / 16 + 16)).collect(),
-            )
-        },
-        |(drec_t, pay_t, pcat_t), chunk| {
+        |_| -> EvT<K> { ((0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(), (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect()) },
+        |(drec_t, pay_t), chunk| {
             let c = ev_chunks[chunk];
             let d = c.data;
             let mut drec = std::mem::take(drec_t);
             let mut pay = std::mem::take(pay_t);
-            let mut pcat = std::mem::take(pcat_t);
-            let mut ring = [Pend::<K>::default(); AHEAD];
-            let (mut head, mut queued) = (0usize, 0usize);
-            let finish = |e: &Pend<K>, pay: &mut Vec<Vec<Pay<K>>>, pcat: &mut Vec<Vec<u16>>, drec: &mut Vec<Vec<Dup<K>>>| {
-                let name = table_of(e.h).get(e.uid, e.h);
-                let p = if name == e.uid { (e.h >> 56) as usize & (NB - 1) } else { shard_of(&name) };
-                let v = &mut pay[p];
-                let i = v.len();
-                if i >= (1 << LOC_BITS) - 1 {
-                    bail.store(true, Relaxed);
-                    return;
-                }
-                v.push(Pay { name, ts: e.ts, price: e.price });
-                if e.price > 0 {
-                    pcat[p].push(e.cat as u16);
-                }
-                drec[shard_of(&e.id)].push(Dup { id: e.id, ingest: e.ingest, loc: (p as u32) << LOC_BITS | i as u32 });
-            };
             dense::each_line::<7>(d, c.skip_first, |fl| {
                 if fl[0].empty() {
                     return;
@@ -2610,45 +2598,29 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                         fail.store(true, Relaxed);
                         break 'v;
                     };
-                    let h = mix(&uid);
-                    table_of(h).prefetch(h);
                     let cat = if price > 0 { category_of(d, fl[5]) } else { 0 };
-                    let e = Pend { id, uid, h, ingest, ts: (ts - ws) as u32, price, cat };
-                    if queued == AHEAD {
-                        finish(&ring[head], &mut pay, &mut pcat, &mut drec);
-                        ring[head] = e;
-                        head = (head + 1) % AHEAD;
-                    } else {
-                        ring[(head + queued) % AHEAD] = e;
-                        queued += 1;
+                    let p = shard_of(&uid);
+                    let v = &mut pay[p];
+                    let i = v.len();
+                    if i >= (1 << LOC_BITS) - 1 {
+                        bail.store(true, Relaxed);
+                        return;
                     }
+                    v.push(Pay { name: uid, ts: (ts - ws) as u32, pc: price | cat << 24 });
+                    drec[shard_of(&id)].push(Dup { id, ingest, loc: (p as u32) << LOC_BITS | i as u32 });
                     return;
                 }
                 // An invalid copy: no payload, but it still takes part in dedup.
                 drec[shard_of(&id)].push(Dup { id, ingest, loc: NOLOC });
             });
-            for k in 0..queued {
-                finish(&ring[(head + k) % AHEAD], &mut pay, &mut pcat, &mut drec);
-            }
             *drec_t = drec;
             *pay_t = pay;
-            *pcat_t = pcat;
         },
     );
-    if fail.load(Relaxed) || bail.load(Relaxed) {
-        return false;
-    }
-    let mut drecs = Vec::with_capacity(threads);
-    let mut pays = Vec::with_capacity(threads);
-    let mut pcats = Vec::with_capacity(threads);
-    for (dr, py, pc) in ev_out {
-        drecs.push(dr);
-        pays.push(py);
-        pcats.push(pc);
-    }
+    let (drecs, pays): (Vec<Vec<Vec<Dup<K>>>>, Vec<Vec<Vec<Pay<K>>>>) = ev_out.into_iter().unzip();
     log(t0, &format!("events parsed ({} chunks)", ev_chunks.len()));
 
-    // ---- Clicks: parse + validate, shard by person.
+    // ---- Clicks: parse + validate, shard by user ID.
     let cl_chunks = make_chunks(&inp.clicks, target);
     let cl_bytes: usize = inp.clicks.iter().map(|b| b.len()).sum();
     let cl_cap = shard_cap(cl_bytes / threads, 46);
@@ -2660,14 +2632,6 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             let c = cl_chunks[chunk];
             let d = c.data;
             let mut out = std::mem::take(out_t);
-            let mut ring = [(Clk::<K>::default(), 0u64); AHEAD];
-            let (mut head, mut queued) = (0usize, 0usize);
-            let finish = |(c, h): &(Clk<K>, u64), out: &mut Vec<Vec<Clk<K>>>| {
-                let uid = c.name; // still the user id; becomes the person here
-                let name = table_of(*h).get(uid, *h);
-                let p = if name == uid { (*h >> 56) as usize & (NB - 1) } else { shard_of(&name) };
-                out[p].push(Clk { name, ..*c });
-            };
             dense::each_line::<4>(d, c.skip_first, |fl| {
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
@@ -2683,27 +2647,20 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     fail.store(true, Relaxed);
                     return;
                 };
-                let h = mix(&uid);
-                table_of(h).prefetch(h);
-                let e = (Clk { name: uid, id, ts: (ts - cbase) as u32, camp }, h);
-                if queued == AHEAD {
-                    finish(&ring[head], &mut out);
-                    ring[head] = e;
-                    head = (head + 1) % AHEAD;
-                } else {
-                    ring[(head + queued) % AHEAD] = e;
-                    queued += 1;
-                }
+                out[shard_of(&uid)].push(Clk { name: uid, id, ts: (ts - cbase) as u32, camp });
             });
-            for k in 0..queued {
-                finish(&ring[(head + k) % AHEAD], &mut out);
-            }
             *out_t = out;
         },
     );
-    if fail.load(Relaxed) {
+    let links = links_handle.join().unwrap();
+    (drecs, pays, clicks, links)
+    });
+    let (drecs, mut pays, mut clicks, links_opt) = links_out;
+    if fail.load(Relaxed) || bail.load(Relaxed) {
         return false;
     }
+    let Some(lk) = links_opt else { return false };
+    links = lk;
     K::settle();
     log(t0, "clicks parsed");
 
@@ -2712,6 +2669,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     // copy's payload is marked DEAD_TS in place.
     let ptrs: Vec<Vec<SendPtr>> =
         pays.iter_mut().map(|v| v.iter_mut().map(|p| SendPtr(p.as_mut_ptr() as usize)).collect()).collect();
+    let lens: Vec<Vec<usize>> = pays.iter().map(|v| v.iter().map(|p| p.len()).collect()).collect();
     // `at` = thread << 32 | loc.
     let kill = |at: u64| {
         let loc = at as u32;
@@ -2753,21 +2711,95 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         },
     );
     drop(drecs);
-    let pays = pays; // read-only from here on
     log(t0, "events deduped");
+
+    // ---- Renaming: each user ID shard looks its IDs up in its own link table
+    // (small: it holds only that shard's IDs), and moves the events and clicks
+    // of IDs that are not their person's name to the person's shard, marking
+    // them dead or moved where they were.
+    let cptrs: Vec<Vec<SendPtr>> =
+        clicks.iter_mut().map(|v| v.iter_mut().map(|p| SendPtr(p.as_mut_ptr() as usize)).collect()).collect();
+    let clens: Vec<Vec<usize>> = clicks.iter().map(|v| v.iter().map(|p| p.len()).collect()).collect();
+    // What stays is compacted to the front of its buffer; its new lengths:
+    let keep_ev: Vec<Vec<AtomicUsize>> = (0..threads).map(|_| (0..NB).map(|_| AtomicUsize::new(0)).collect()).collect();
+    let keep_cl: Vec<Vec<AtomicUsize>> = (0..threads).map(|_| (0..NB).map(|_| AtomicUsize::new(0)).collect()).collect();
+    type MvT<K> = (Vec<Vec<Pay<K>>>, Vec<Vec<Clk<K>>>);
+    // Biggest shards first; room for about half of the records moving.
+    let mut rorder: Vec<usize> = (0..NB).collect();
+    rorder.sort_unstable_by_key(|&p| std::cmp::Reverse(lens.iter().map(|v| v[p]).sum::<usize>()));
+    let n_ev: usize = lens.iter().flatten().sum();
+    let n_cl: usize = clens.iter().flatten().sum();
+    let (mcap, ccap) = (n_ev / (2 * threads * NB) + 16, n_cl / (2 * threads * NB) + 16);
+    let moved: Vec<MvT<K>> = dense::per_thread(
+        NB,
+        threads,
+        |_| -> MvT<K> { ((0..NB).map(|_| Vec::with_capacity(mcap)).collect(), (0..NB).map(|_| Vec::with_capacity(ccap)).collect()) },
+        |(mp, mc), i| {
+            let sh = rorder[i];
+            let lt = &links[sh];
+            for t in 0..threads {
+                // SAFETY: shard `sh` of every thread's buffers belongs to this task
+                // alone; the lengths are those buffers' lengths.
+                let ev = unsafe { std::slice::from_raw_parts_mut(ptrs[t][sh].0 as *mut Pay<K>, lens[t][sh]) };
+                let mut w = 0;
+                for i in 0..ev.len() {
+                    let r = ev[i];
+                    if r.ts == DEAD_TS {
+                        continue;
+                    }
+                    let name = lt.get(r.name, mix(&r.name));
+                    if name != r.name {
+                        mp[shard_of(&name)].push(Pay { name, ..r });
+                    } else {
+                        ev[w] = r;
+                        w += 1;
+                    }
+                }
+                keep_ev[t][sh].store(w, Relaxed);
+                let cl = unsafe { std::slice::from_raw_parts_mut(cptrs[t][sh].0 as *mut Clk<K>, clens[t][sh]) };
+                let mut w = 0;
+                for i in 0..cl.len() {
+                    let r = cl[i];
+                    let name = lt.get(r.name, mix(&r.name));
+                    if name != r.name {
+                        mc[shard_of(&name)].push(Clk { name, ..r });
+                    } else {
+                        cl[w] = r;
+                        w += 1;
+                    }
+                }
+                keep_cl[t][sh].store(w, Relaxed);
+            }
+        },
+    );
+    let pays = pays; // read-only from here on
+    let clicks = clicks;
+    log(t0, "renamed");
 
     // ---- Per person shard: sessions, credit, assists, aggregates.
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let size = (ncamp + 1) * ndays;
+    let shard_len = |p: usize| keep_ev.iter().map(|v| v[p].load(Relaxed)).sum::<usize>() + moved.iter().map(|m| m.0[p].len()).sum::<usize>();
     let mut order: Vec<usize> = (0..NB).collect();
-    order.sort_unstable_by_key(|&p| std::cmp::Reverse(pays.iter().map(|v| v[p].len()).sum::<usize>()));
+    order.sort_unstable_by_key(|&p| std::cmp::Reverse(shard_len(p)));
     let env = ShardEnv { ws, day0, ndays, ncat, organic };
     let results: Vec<(Vec<URow<K>>, Vec<[i64; 4]>)> = dense::per_thread(
         NB,
         threads,
         |_| (Vec::new(), vec![[0i64; 4]; size], Scratch2::<K>::default()),
-        |(urows, camp, sc), i| process_shard(order[i], &pays, &pcats, &clicks, &env, urows, camp, sc),
+        |(urows, camp, sc), i| {
+            let p = order[i];
+            let ev: Vec<&[Pay<K>]> = (0..threads)
+                .map(|t| &pays[t][p][..keep_ev[t][p].load(Relaxed)])
+                .chain(moved.iter().map(|m| &m.0[p][..]))
+                .collect();
+            let cl: Vec<&[Clk<K>]> = (0..threads)
+                .map(|t| &clicks[t][p][..keep_cl[t][p].load(Relaxed)])
+                .chain(moved.iter().map(|m| &m.1[p][..]))
+                .collect();
+            process_shard(&ev, &cl, &env, urows, camp, sc)
+        },
     )
     .into_iter()
     .map(|(u, c, _)| (u, c))
@@ -2878,16 +2910,14 @@ fn sort_u64(v: &mut [u64]) {
 /// person's events and clicks are side by side.
 #[allow(clippy::too_many_arguments)]
 fn process_shard<'a, K: Key<'a>>(
-    p: usize,
-    pays: &[Vec<Vec<Pay<K>>>],
-    pcats: &[Vec<Vec<u16>>],
-    clicks: &[Vec<Vec<Clk<K>>>],
+    pays: &[&[Pay<K>]],
+    clicks: &[&[Clk<K>]],
     env: &ShardEnv,
     urows: &mut Vec<URow<K>>,
     camp: &mut [[i64; 4]],
     sc: &mut Scratch2<K>,
 ) {
-    let n_all: usize = pays.iter().map(|d| d[p].len()).sum(); // live and dead
+    let n_all: usize = pays.iter().map(|d| d.len()).sum(); // live and dead
     if n_all == 0 {
         return;
     }
@@ -2900,7 +2930,7 @@ fn process_shard<'a, K: Key<'a>>(
     off.resize(nb + 1, 0);
     bid.clear();
     for d in pays {
-        for r in &d[p] {
+        for r in d.iter() {
             if r.ts == DEAD_TS {
                 continue;
             }
@@ -2917,31 +2947,26 @@ fn process_shard<'a, K: Key<'a>>(
     cur.clear();
     cur.extend_from_slice(&off[..nb]);
     let mut k = 0;
-    for (d, pc) in pays.iter().zip(pcats) {
-        let pc = &pc[p];
-        let mut ci = 0;
-        for r in &d[p] {
-            let mut c = 0;
-            if r.price > 0 {
-                c = pc[ci] as u32;
-                ci += 1;
-            }
+    for d in pays {
+        for r in d.iter() {
             if r.ts == DEAD_TS {
                 continue; // skipped in the first pass too, so k stays in step
             }
             let b = bid[k] as usize;
             k += 1;
-            evs[cur[b] as usize] = EvR { name: r.name, ts: r.ts, price: r.price, cat: c };
+            evs[cur[b] as usize] = EvR { name: r.name, ts: r.ts, price: r.pc & 0xff_ffff, cat: r.pc >> 24 };
             cur[b] += 1;
         }
     }
-    // Clicks, bucketed the same way.
-    let n_cl: usize = clicks.iter().map(|c| c[p].len()).sum();
+    // Clicks (not the moved ones), bucketed the same way.
     coff.clear();
     coff.resize(nb + 1, 0);
     bid.clear();
     for c in clicks {
-        for r in &c[p] {
+        for r in c.iter() {
+            if r.ts == MOVED_TS {
+                continue;
+            }
             let b = bucket(r.name);
             coff[b + 1] += 1;
             bid.push(b as u32);
@@ -2951,12 +2976,15 @@ fn process_shard<'a, K: Key<'a>>(
         coff[i + 1] += coff[i];
     }
     cls.clear();
-    cls.resize(n_cl, Clk::default());
+    cls.resize(bid.len(), Clk::default());
     cur.clear();
     cur.extend_from_slice(&coff[..nb]);
     let mut k = 0;
     for c in clicks {
-        for r in &c[p] {
+        for r in c.iter() {
+            if r.ts == MOVED_TS {
+                continue;
+            }
             let b = bid[k] as usize;
             k += 1;
             cls[cur[b] as usize] = *r;

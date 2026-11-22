@@ -380,8 +380,10 @@ pub(crate) fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<
             s = p + 1;
         }
         fl[N - 1] = Fd::new(s, ls + e as usize);
+        // Checked even with no quotes (then it changes nothing): quoting is
+        // random, so a branch on it would mispredict.
         let quotes = ((mask(v0, b'"') | mask(v1, b'"') << 32) & below).count_ones();
-        if quotes != 0 && !unwrap_quotes_bl(d, &mut fl, quotes) {
+        if !unwrap_quotes_bl(d, &mut fl, quotes) {
             return Some((None, next));
         }
         return Some((Some(fl), next));
@@ -402,22 +404,19 @@ pub(crate) fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<
     }
     let mut s = ls;
     for x in fl.iter_mut().take(N - 1) {
-        let p = if cl != 0 {
-            let t = cl.trailing_zeros();
-            cl &= cl - 1;
-            t
-        } else {
-            let t = 64 + ch.trailing_zeros();
-            ch &= ch - 1;
-            t
-        };
-        let p = ls + p as usize;
+        // From the first half while it has commas, then the second; selects,
+        // not branches (how many commas each half holds varies line to line).
+        let lo = cl != 0;
+        let t = if lo { cl.trailing_zeros() } else { 64 + ch.trailing_zeros() };
+        cl &= cl.wrapping_sub(1);
+        ch = if lo { ch } else { ch & ch.wrapping_sub(1) };
+        let p = ls + t as usize;
         *x = Fd::new(s, p);
         s = p + 1;
     }
     fl[N - 1] = Fd::new(s, ls + 64 + eh as usize);
     let quotes = (mask(v0, b'"') | mask(v1, b'"') << 32).count_ones() + ((mask(v2, b'"') | mask(v3, b'"') << 32) & below).count_ones();
-    if quotes != 0 && !unwrap_quotes_bl(d, &mut fl, quotes) {
+    if !unwrap_quotes_bl(d, &mut fl, quotes) {
         return Some((None, next));
     }
     Some((Some(fl), next))
