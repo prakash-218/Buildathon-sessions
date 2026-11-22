@@ -2467,15 +2467,6 @@ struct Clk<K> {
     camp: u32,
 }
 
-/// An event in its person shard's working array.
-#[derive(Clone, Copy, Default)]
-struct EvR<K> {
-    name: K,
-    ts: u32,
-    price: u32,
-    cat: u32,
-}
-
 /// Group order for a person shard's arrays: by `grp`, then (only for keys
 /// whose `grp` can collide) by the key itself.
 #[inline(always)]
@@ -2878,12 +2869,11 @@ struct Scratch2<K> {
     bid: Vec<u32>,
     off: Vec<u32>,
     cur: Vec<u32>,
-    evs: Vec<EvR<K>>,
+    evs: Vec<Pay<K>>,
     coff: Vec<u32>,
     cls: Vec<Clk<K>>,
     cl1: Vec<(u32, u32)>,
     keys: Vec<u64>,
-    sorted: Vec<EvR<K>>,
     ps: PScratch,
 }
 
@@ -2921,7 +2911,7 @@ fn process_shard<'a, K: Key<'a>>(
     if n_all == 0 {
         return;
     }
-    let Scratch2 { bid, off, cur, evs, coff, cls, cl1, keys, sorted, ps } = sc;
+    let Scratch2 { bid, off, cur, evs, coff, cls, cl1, keys, ps } = sc;
     let nb = (n_all / 8).next_power_of_two().clamp(16, 1 << 20);
     let mask = nb - 1;
     // Bits of mix() below the shard's top 8, so buckets split each shard evenly.
@@ -2943,7 +2933,8 @@ fn process_shard<'a, K: Key<'a>>(
         off[i + 1] += off[i];
     }
     evs.clear();
-    evs.resize(bid.len(), EvR::default());
+    // SAFETY-free fill: every slot is written below (counting sort).
+    evs.resize(bid.len(), Pay { name: K::default(), ts: 0, pc: 0 });
     cur.clear();
     cur.extend_from_slice(&off[..nb]);
     let mut k = 0;
@@ -2954,7 +2945,7 @@ fn process_shard<'a, K: Key<'a>>(
             }
             let b = bid[k] as usize;
             k += 1;
-            evs[cur[b] as usize] = EvR { name: r.name, ts: r.ts, price: r.pc & 0xff_ffff, cat: r.pc >> 24 };
+            evs[cur[b] as usize] = *r;
             cur[b] += 1;
         }
     }
@@ -3000,13 +2991,11 @@ fn process_shard<'a, K: Key<'a>>(
         let cl = &mut cls[coff[b] as usize..coff[b + 1] as usize];
         let name0 = ev[0].name;
         if ev.iter().all(|e| e.name == name0) {
-            // One person (the usual case): sort (ts, index) keys, not records.
+            // One person (the usual case): sort event keys, not records.
             keys.clear();
-            keys.extend(ev.iter().enumerate().map(|(i, e)| (e.ts as u64) << 32 | i as u64));
+            keys.extend(ev.iter().enumerate().map(|(i, e)| ev_key(e, i)));
             sort_u64(keys);
-            sorted.clear();
-            sorted.extend(keys.iter().map(|&k| ev[k as u32 as usize]));
-            keys.clear();
+            let ord = std::mem::take(keys);
             keys.extend(cl.iter().enumerate().filter(|(_, c)| c.name == name0).map(|(i, c)| (c.ts as u64) << 32 | i as u64));
             sort_u64(keys);
             // Equal ts: smallest click_id first.
@@ -3026,7 +3015,8 @@ fn process_shard<'a, K: Key<'a>>(
                 let c = &cl[k as u32 as usize];
                 (c.ts, c.camp)
             }));
-            person(sorted, cl1, name0, env, ps, urows, camp);
+            person(ev, &ord, cl1, name0, env, ps, urows, camp);
+            *keys = ord;
             continue;
         }
         if K::UNIQUE {
@@ -3052,19 +3042,31 @@ fn process_shard<'a, K: Key<'a>>(
             }
             cl1.clear();
             cl1.extend(cl[j..f].iter().map(|c| (c.ts, c.camp)));
-            person(&ev[i..e], cl1, name, env, ps, urows, camp);
+            keys.clear();
+            keys.extend(ev[i..e].iter().enumerate().map(|(x, r)| ev_key(r, x)));
+            person(&ev[i..e], keys, cl1, name, env, ps, urows, camp);
             i = e;
             j = f;
         }
     }
 }
 
-/// One person's events (sorted by ts) and clicks (ts - (ws - 7 days),
-/// campaign; sorted by ts, then click_id) -> their user_daily rows and
-/// campaign counters. `camp[c * ndays + day]` = [sessions, purchasing, revenue, assisted].
+/// An event's sort key in its person's group: ts, then a purchase bit, then
+/// its index (so ts order needs no records, and only purchases are read).
+#[inline(always)]
+fn ev_key<K>(e: &Pay<K>, i: usize) -> u64 {
+    (e.ts as u64) << 32 | ((e.pc != 0) as u64) << 31 | i as u64
+}
+
+/// One person's events (`ord`: their `ev_key`s, sorted) and clicks (ts - (ws
+/// - 7 days), campaign; sorted by ts, then click_id) -> their user_daily rows
+/// and campaign counters. `camp[c * ndays + day]` = [sessions, purchasing,
+/// revenue, assisted].
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn person<K: Copy>(
-    ev: &[EvR<K>],
+    ev: &[Pay<K>],
+    ord: &[u64],
     cl: &mut [(u32, u32)],
     name: K,
     env: &ShardEnv,
@@ -3074,8 +3076,9 @@ fn person<K: Copy>(
 ) {
     let PScratch { catsum, touched, starts, sdays, run_end, pairs } = ps;
     let ShardEnv { ws, day0, ndays, organic, .. } = *env;
-    let n = ev.len();
+    let n = ord.len();
     let m = cl.len();
+    let tsk = |k: u64| (k >> 32) as i64;
     starts.clear();
     sdays.clear();
     // Times from here on: ms from ws (clicks shifted to match).
@@ -3101,9 +3104,9 @@ fn person<K: Copy>(
     let (mut hi, mut run_start) = (0usize, 0usize);
     let mut i = 0usize;
     while i < n {
-        let s = ev[i].ts as i64;
+        let s = tsk(ord[i]);
         let mut j = i + 1;
-        while j < n && (ev[j].ts - ev[j - 1].ts) as i64 <= GAP {
+        while j < n && tsk(ord[j]) - tsk(ord[j - 1]) <= GAP {
             j += 1;
         }
         let day = ((ws + s).div_euclid(DAY) - day0) as u32;
@@ -3118,15 +3121,17 @@ fn person<K: Copy>(
             u_ev = 0;
             u_rev = 0;
         }
-        for e in &ev[i..j] {
-            if e.price > 0 {
+        for &k in &ord[i..j] {
+            if k & (1 << 31) != 0 {
+                let pc = ev[(k as u32 & 0x7fff_ffff) as usize].pc;
+                let (price, cat) = (pc & 0xff_ffff, pc >> 24);
                 purchased = true;
-                rev += e.price as i64;
-                let c = e.cat as usize;
+                rev += price as i64;
+                let c = cat as usize;
                 if catsum[c] == 0 {
-                    touched.push(e.cat);
+                    touched.push(cat);
                 }
-                catsum[c] += e.price as u64;
+                catsum[c] += price as u64;
             }
         }
         u_sess += 1;
