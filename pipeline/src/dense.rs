@@ -1192,7 +1192,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                             cx_cl[shard_of(&name)].push(CRec { name, id: x.id, ts: x.ts, camp: x.camp });
                         }
                     }
-                    person(ev, cl, pk_name(pk0), day0, organic, ndays, ps, urows, camp);
+                    person_old(ev, cl, pk_name(pk0), day0, organic, ndays, ps, urows, camp);
                     continue;
                 }
                 // Otherwise group this person's events and clicks by person key.
@@ -1244,7 +1244,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
                     ev.extend(tev[a..a2].iter().map(|e| e.1));
                     cl.clear();
                     cl.extend(tcl[b..b2].iter().filter(|c| c.0 == pk).map(|c| c.1));
-                    person(ev, cl, pk_name(pk), day0, organic, ndays, ps, urows, camp);
+                    person_old(ev, cl, pk_name(pk), day0, organic, ndays, ps, urows, camp);
                     a = a2;
                     b = b2;
                 }
@@ -1276,7 +1276,7 @@ pub(crate) fn run<'a>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize,
         threads,
         |_| (Vec::new(), vec![[0i64; 4]; size], Scratch::<u64>::default()),
         |(urows, camp, sc), i| {
-            process_shard(order[i], &cx_pays, &cx_clicks, day0, ndays, cat.ncat, organic, urows, camp, sc);
+            process_shard_old(order[i], &cx_pays, &cx_clicks, day0, ndays, cat.ncat, organic, urows, camp, sc);
         },
     )
     .into_iter()
