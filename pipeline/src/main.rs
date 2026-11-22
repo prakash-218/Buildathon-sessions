@@ -2938,6 +2938,7 @@ struct Scratch2<K> {
     cls: Vec<Clk<K>>,
     cl1: Vec<(u32, u32)>,
     keys: Vec<u64>,
+    ckeys: Vec<u64>,
     ps: PScratch,
 }
 
@@ -2975,7 +2976,7 @@ fn process_shard<'a, K: Key<'a>>(
     if n_all == 0 {
         return;
     }
-    let Scratch2 { bid, off, cur, evs, coff, cls, cl1, keys, ps } = sc;
+    let Scratch2 { bid, off, cur, evs, coff, cls, cl1, keys, ckeys, ps } = sc;
     let nb = (n_all / 8).next_power_of_two().clamp(16, 1 << 20);
     let mask = nb - 1;
     // Bits of mix() below the shard's top 8, so buckets split each shard evenly.
@@ -3059,28 +3060,27 @@ fn process_shard<'a, K: Key<'a>>(
             keys.clear();
             keys.extend(ev.iter().enumerate().map(|(i, e)| ev_key(e, i)));
             sort_u64(keys);
-            let ord = std::mem::take(keys);
-            keys.extend(cl.iter().enumerate().filter(|(_, c)| c.name == name0).map(|(i, c)| (c.ts as u64) << 32 | i as u64));
-            sort_u64(keys);
+            ckeys.clear();
+            ckeys.extend(cl.iter().enumerate().filter(|(_, c)| c.name == name0).map(|(i, c)| (c.ts as u64) << 32 | i as u64));
+            sort_u64(ckeys);
             // Equal ts: smallest click_id first.
             let mut a = 0;
-            while a < keys.len() {
+            while a < ckeys.len() {
                 let mut z = a + 1;
-                while z < keys.len() && keys[z] >> 32 == keys[a] >> 32 {
+                while z < ckeys.len() && ckeys[z] >> 32 == ckeys[a] >> 32 {
                     z += 1;
                 }
                 if z - a > 1 {
-                    keys[a..z].sort_unstable_by(|x, y| cl[*x as u32 as usize].id.cmp(&cl[*y as u32 as usize].id));
+                    ckeys[a..z].sort_unstable_by(|x, y| cl[*x as u32 as usize].id.cmp(&cl[*y as u32 as usize].id));
                 }
                 a = z;
             }
             cl1.clear();
-            cl1.extend(keys.iter().map(|&k| {
+            cl1.extend(ckeys.iter().map(|&k| {
                 let c = &cl[k as u32 as usize];
                 (c.ts, c.camp)
             }));
-            person(ev, &ord, cl1, name0, env, ps, urows, camp);
-            *keys = ord;
+            person(ev, keys, cl1, name0, env, ps, urows, camp);
             continue;
         }
         if K::UNIQUE {
