@@ -463,7 +463,7 @@ fn uid(d: &[u8], f: Fd, ukey: u64, pmax: u64) -> Option<Uid> {
 
 /// Run `work` on chunks 0..n from `threads` scoped threads, each with its own
 /// state from `init(thread)`; returns the states in thread order.
-fn per_thread<T: Send>(n: usize, threads: usize, init: impl Fn(usize) -> T + Sync, work: impl Fn(&mut T, usize) + Sync) -> Vec<T> {
+pub(crate) fn per_thread<T: Send>(n: usize, threads: usize, init: impl Fn(usize) -> T + Sync, work: impl Fn(&mut T, usize) + Sync) -> Vec<T> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)

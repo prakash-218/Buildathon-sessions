@@ -141,7 +141,33 @@ struct Id {
     lo: u64,
 }
 
-/// 32 hex digits (lowercase, or uppercase if `upper`) -> their value.
+/// 32 hex digits (lowercase, or uppercase if `upper`) -> their value: one
+/// 32-byte load checks them all, a multiply-add joins digit pairs into bytes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn hex32(b: &[u8], upper: bool) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    assert!(b.len() >= 32);
+    // SAFETY: b has at least 32 bytes.
+    unsafe {
+        let v = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let dg = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let is_dg = _mm256_cmpeq_epi8(_mm256_min_epu8(dg, _mm256_set1_epi8(9)), dg);
+        let lt = _mm256_sub_epi8(v, _mm256_set1_epi8(if upper { b'A' } else { b'a' } as i8));
+        let is_lt = _mm256_cmpeq_epi8(_mm256_min_epu8(lt, _mm256_set1_epi8(5)), lt);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_dg, is_lt)) != -1 {
+            return None;
+        }
+        let val = _mm256_blendv_epi8(dg, _mm256_add_epi8(lt, _mm256_set1_epi8(10)), is_lt);
+        let p = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0110)); // 16 * first + second
+        let packed = _mm256_packus_epi16(p, p); // each lane: its 8 bytes, twice
+        let hi = _mm_cvtsi128_si64(_mm256_castsi256_si128(packed)) as u64;
+        let lo = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(packed)) as u64;
+        Some((hi.swap_bytes(), lo.swap_bytes()))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
 fn hex32(b: &[u8], upper: bool) -> Option<(u64, u64)> {
     let letter0 = if upper { b'A' } else { b'a' };
@@ -1722,17 +1748,19 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let size = (ncamp + 1) * ndays;
-    let results: Vec<(Vec<URow<K>>, Vec<[i64; 4]>)> = (0..NB)
-        .into_par_iter()
-        .fold(
-            || (Vec::new(), vec![[0i64; 4]; size], Scratch::<K>::default()),
-            |(mut urows, mut camp, mut sc), p| {
-                process_shard(p, &pays, &clicks, day0, ndays, ncat, organic, &mut urows, &mut camp, &mut sc);
-                (urows, camp, sc)
-            },
-        )
-        .map(|(u, c, _)| (u, c))
-        .collect();
+    // One accumulator per thread (a fold makes one per work split, each with a
+    // campaign table to zero and then sum on one thread); biggest shards first.
+    let mut order: Vec<usize> = (0..NB).collect();
+    order.sort_unstable_by_key(|&p| std::cmp::Reverse(pays.iter().map(|v| v[p].len()).sum::<usize>()));
+    let results: Vec<(Vec<URow<K>>, Vec<[i64; 4]>)> = dense::per_thread(
+        NB,
+        threads,
+        |_| (Vec::new(), vec![[0i64; 4]; size], Scratch::<K>::default()),
+        |(urows, camp, sc), i| process_shard(order[i], &pays, &clicks, day0, ndays, ncat, organic, urows, camp, sc),
+    )
+    .into_iter()
+    .map(|(u, c, _)| (u, c))
+    .collect();
     log(t0, "sessions done");
 
     // ---- Write.
@@ -1799,11 +1827,15 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         }
     }
     if mode != "none" {
+        // In pieces of at most 64 MB, so every thread gets some.
+        const PIECE: usize = 64 << 20;
         for b in inp.events.iter().chain(&inp.clicks).chain(&inp.links) {
-            regions.push((b.as_ptr() as usize, b.len()));
+            for o in (0..b.len()).step_by(PIECE) {
+                regions.push((b.as_ptr() as usize + o, PIECE.min(b.len() - o)));
+            }
         }
     }
-    regions.par_iter().with_min_len(64).for_each(|&(p, len)| release(p, len));
+    regions.par_iter().for_each(|&(p, len)| release(p, len));
     log(t0, "done");
     std::process::exit(0);
 }
