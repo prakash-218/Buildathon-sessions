@@ -50,6 +50,21 @@ trait Key<'a>: Copy + Eq + Ord + Hash + Send + Sync + Default {
     /// The ID `d[s..e]`, or None if this key type cannot hold it.
     fn make(d: &'a [u8], s: usize, e: usize) -> Option<Self>;
     fn put(self, out: &mut Vec<u8>);
+    /// A key only ever compared for equality, never ordered or written out
+    /// (event IDs): it may skip whatever only order and output need.
+    #[inline(always)]
+    fn make_eq(d: &'a [u8], s: usize, e: usize) -> Option<Self> {
+        Self::make(d, s, e)
+    }
+    /// A key met while parsing events or clicks: what order and output need
+    /// may wait until `settle`.
+    #[inline(always)]
+    fn make_late(d: &'a [u8], s: usize, e: usize) -> Option<Self> {
+        Self::make(d, s, e)
+    }
+    /// Called once events and clicks are parsed, before any key made by
+    /// `make_late` is ordered or written out.
+    fn settle() {}
 }
 
 impl<'a> Key<'a> for u128 {
@@ -238,7 +253,7 @@ impl<'a> Key<'a> for Id {
 struct Lid(u64);
 
 const LID_LONG: u64 = 1 << 63;
-const LID_SHARDS: usize = 256;
+const LID_SHARDS: usize = 4096;
 static LID_REG: std::sync::OnceLock<Vec<std::sync::Mutex<FxHashMap<u64, Id>>>> = std::sync::OnceLock::new();
 static LID_CLASH: AtomicBool = AtomicBool::new(false);
 
@@ -274,14 +289,108 @@ impl Ord for Lid {
     }
 }
 
+/// Long IDs met while parsing (digest, ID), per thread: `eq` only need their
+/// digests checked (event IDs), `late` also go in the registry. A thread's
+/// lists move to LID_PEND when the thread ends (the parse threads end with
+/// their phase), and `settle` takes them from there.
+#[derive(Default)]
+struct LidPend {
+    eq: Vec<(u64, Id)>,
+    late: Vec<(u64, Id)>,
+}
+
+impl Drop for LidPend {
+    fn drop(&mut self) {
+        if !self.eq.is_empty() || !self.late.is_empty() {
+            LID_PEND.lock().unwrap().push(std::mem::take(self));
+        }
+    }
+}
+
+static LID_PEND: std::sync::Mutex<Vec<LidPend>> = std::sync::Mutex::new(Vec::new());
+thread_local! {
+    static LID_LOCAL: std::cell::RefCell<LidPend> = std::cell::RefCell::new(LidPend::default());
+}
+
+#[inline(always)]
+fn lid_digest(id: &Id) -> u64 {
+    fmix64(id.hi ^ id.lo.rotate_left(29) ^ id.a.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | LID_LONG
+}
+
 impl<'a> Key<'a> for Lid {
+    #[inline(always)]
+    fn make_eq(d: &'a [u8], s: usize, e: usize) -> Option<Lid> {
+        if e - s <= 9 {
+            return <u64 as Key>::make(d, s, e).map(Lid);
+        }
+        let id = Id::make(d, s, e)?;
+        let digest = lid_digest(&id);
+        LID_LOCAL.with(|p| p.borrow_mut().eq.push((digest, id)));
+        Some(Lid(digest))
+    }
+    #[inline(always)]
+    fn make_late(d: &'a [u8], s: usize, e: usize) -> Option<Lid> {
+        if e - s <= 9 {
+            return <u64 as Key>::make(d, s, e).map(Lid);
+        }
+        let id = Id::make(d, s, e)?;
+        let digest = lid_digest(&id);
+        LID_LOCAL.with(|p| p.borrow_mut().late.push((digest, id)));
+        Some(Lid(digest))
+    }
+    fn settle() {
+        // Every list bucketed by registry shard (a counting pass, all lists at
+        // once); then each shard is settled by one task: digests checked for
+        // clashes, and the `late` IDs registered, with no contention.
+        let lists = std::mem::take(&mut *LID_PEND.lock().unwrap());
+        let shard_of_d = |d: u64| (d >> 32) as usize % LID_SHARDS;
+        let bucket = |v: &[(u64, Id)]| -> (Vec<(u64, Id)>, Vec<u32>) {
+            let mut start = vec![0u32; LID_SHARDS + 1];
+            for x in v {
+                start[shard_of_d(x.0) + 1] += 1;
+            }
+            for i in 0..LID_SHARDS {
+                start[i + 1] += start[i];
+            }
+            let mut cur = start.clone();
+            let mut out = vec![(0u64, Id::default()); v.len()];
+            for x in v {
+                let b = shard_of_d(x.0);
+                out[cur[b] as usize] = *x;
+                cur[b] += 1;
+            }
+            (out, start)
+        };
+        let eqs: Vec<(Vec<(u64, Id)>, Vec<u32>)> = lists.par_iter().map(|l| bucket(&l.eq)).collect();
+        let lates: Vec<(Vec<(u64, Id)>, Vec<u32>)> = lists.par_iter().map(|l| bucket(&l.late)).collect();
+        drop(lists);
+        let reg = lid_reg();
+        (0..LID_SHARDS).into_par_iter().with_min_len(16).for_each_init(FxHashMap::<u64, Id>::default, |seen, b| {
+            seen.clear();
+            for (v, st) in &eqs {
+                for x in &v[st[b] as usize..st[b + 1] as usize] {
+                    if *seen.entry(x.0).or_insert(x.1) != x.1 {
+                        LID_CLASH.store(true, Relaxed);
+                    }
+                }
+            }
+            let mut m = reg[b].lock().unwrap();
+            for (v, st) in &lates {
+                for x in &v[st[b] as usize..st[b + 1] as usize] {
+                    if *m.entry(x.0).or_insert(x.1) != x.1 {
+                        LID_CLASH.store(true, Relaxed);
+                    }
+                }
+            }
+        });
+    }
     #[inline(always)]
     fn make(d: &'a [u8], s: usize, e: usize) -> Option<Lid> {
         if e - s <= 9 {
             return <u64 as Key>::make(d, s, e).map(Lid);
         }
         let id = Id::make(d, s, e)?;
-        let digest = fmix64(id.hi ^ id.lo.rotate_left(29) ^ id.a.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | LID_LONG;
+        let digest = lid_digest(&id);
         let shard = &lid_reg()[(digest >> 32) as usize % LID_SHARDS];
         let mut m = shard.lock().unwrap();
         match m.entry(digest) {
@@ -1669,7 +1778,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 if fl[0].empty() {
                     return;
                 }
-                let Some(id) = K::make(d, fl[0].s(), fl[0].e()) else {
+                let Some(id) = K::make_eq(d, fl[0].s(), fl[0].e()) else {
                     fail.store(true, Relaxed);
                     return;
                 };
@@ -1693,7 +1802,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     if ingest.saturating_sub(ts) > DAY {
                         break 'v; // late
                     }
-                    let Some(uid) = K::make(d, fl[1].s(), fl[1].e()) else {
+                    let Some(uid) = K::make_late(d, fl[1].s(), fl[1].e()) else {
                         fail.store(true, Relaxed);
                         break 'v;
                     };
@@ -1760,7 +1869,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 if ts < ws - WEEK || ts >= we {
                     return;
                 }
-                let (Some(id), Some(uid)) = (K::make(d, fl[0].s(), fl[0].e()), K::make(d, fl[1].s(), fl[1].e())) else {
+                let (Some(id), Some(uid)) = (K::make_late(d, fl[0].s(), fl[0].e()), K::make_late(d, fl[1].s(), fl[1].e())) else {
                     fail.store(true, Relaxed);
                     return;
                 };
@@ -1785,6 +1894,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     if fail.load(Relaxed) {
         return false;
     }
+    K::settle();
     log(t0, "clicks parsed");
 
     // ---- Dedup each event_id shard: the copy with the smallest ingest_ts is kept
