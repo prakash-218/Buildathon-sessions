@@ -343,15 +343,16 @@ const P_NONE: u64 = 0;
 const P_COMPLEX: u64 = u64::MAX;
 
 /// The N fields of the line starting at `ls`, split in one go: 32-byte loads
-/// give its newline, comma and quote masks (one 64-byte window as u64 when the
-/// line fits in it, else a 128-byte one as u128); the first newline ends the
-/// line; it is well formed iff N - 1 commas come before it and its quotes all
-/// wrap whole fields. Returns (fields, or None for a malformed line; where the
-/// next line starts), or None (use the slow path) for a line of 128 bytes or
-/// more, or one too near the end of `d`.
+/// give its newline, comma and quote masks (one 64-byte window when the line
+/// fits in it, else two, as two u64 halves); the first newline ends the line;
+/// it is well formed iff N - 1 commas come before it and its quotes all wrap
+/// whole fields. Returns (fields, or None for a malformed line; where the next
+/// line starts), or None (use the slow path) for a line of 128 bytes or more,
+/// or one too near the end of `d`. A line whose first field is empty may come
+/// back as malformed when it has quotes (every caller drops such lines).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<[Fd; N]>, usize)> {
+pub(crate) fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<[Fd; N]>, usize)> {
     use std::arch::x86_64::*;
     if ls + 128 > d.len() {
         return None;
@@ -379,40 +380,69 @@ fn split_line<const N: usize>(d: &[u8], ls: usize) -> Option<(Option<[Fd; N]>, u
             s = p + 1;
         }
         fl[N - 1] = Fd::new(s, ls + e as usize);
-        let quotes = ((mask(v0, b'"') | mask(v1, b'"') << 32) & below).count_ones() as u64;
-        if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
+        let quotes = ((mask(v0, b'"') | mask(v1, b'"') << 32) & below).count_ones();
+        if quotes != 0 && !unwrap_quotes_bl(d, &mut fl, quotes) {
             return Some((None, next));
         }
         return Some((Some(fl), next));
     }
     let (v2, v3) = (load(2), load(3));
-    let wide = |c: u8| -> u128 {
-        (mask(v0, c) | mask(v1, c) << 32) as u128 | ((mask(v2, c) | mask(v3, c) << 32) as u128) << 64
-    };
-    let nl = wide(b'\n');
-    if nl == 0 {
+    let nh = mask(v2, b'\n') | mask(v3, b'\n') << 32;
+    if nh == 0 {
         return None;
     }
-    let e = nl.trailing_zeros();
-    let next = ls + e as usize + 1;
-    let below = (1u128 << e) - 1;
-    let mut m = wide(b',') & below;
-    if m.count_ones() as usize != N - 1 {
+    // The line ends in the second 64 bytes: all of the first half is in it.
+    let eh = nh.trailing_zeros();
+    let next = ls + 64 + eh as usize + 1;
+    let below = (1u64 << eh) - 1;
+    let mut cl = mask(v0, b',') | mask(v1, b',') << 32;
+    let mut ch = (mask(v2, b',') | mask(v3, b',') << 32) & below;
+    if (cl.count_ones() + ch.count_ones()) as usize != N - 1 {
         return Some((None, next));
     }
     let mut s = ls;
     for x in fl.iter_mut().take(N - 1) {
-        let p = ls + m.trailing_zeros() as usize;
-        m &= m - 1;
+        let p = if cl != 0 {
+            let t = cl.trailing_zeros();
+            cl &= cl - 1;
+            t
+        } else {
+            let t = 64 + ch.trailing_zeros();
+            ch &= ch - 1;
+            t
+        };
+        let p = ls + p as usize;
         *x = Fd::new(s, p);
         s = p + 1;
     }
-    fl[N - 1] = Fd::new(s, ls + e as usize);
-    let quotes = (wide(b'"') & below).count_ones() as u64;
-    if quotes != 0 && !unwrap_quotes(d, &mut fl, quotes) {
+    fl[N - 1] = Fd::new(s, ls + 64 + eh as usize);
+    let quotes = (mask(v0, b'"') | mask(v1, b'"') << 32).count_ones() + ((mask(v2, b'"') | mask(v3, b'"') << 32) & below).count_ones();
+    if quotes != 0 && !unwrap_quotes_bl(d, &mut fl, quotes) {
         return Some((None, next));
     }
     Some((Some(fl), next))
+}
+
+/// `unwrap_quotes` without a branch per field: every field opens with a quote
+/// iff it closes with one (and then has at least 2 bytes), and those are all
+/// the line's `quotes`. False for an empty first field (not checked).
+#[inline(always)]
+fn unwrap_quotes_bl<const N: usize>(d: &[u8], fl: &mut [Fd; N], quotes: u32) -> bool {
+    if fl[0].empty() {
+        return false;
+    }
+    let (mut bad, mut opened) = (0u32, 0u32);
+    for x in fl.iter_mut() {
+        let (s, e) = (x.s(), x.e());
+        // d[s] is in the line (a separator if the field is empty); e >= 1
+        // since the first field is not empty.
+        let oq = (at(d, s) == b'"') as u32;
+        let cq = (at(d, e - 1) == b'"') as u32;
+        bad |= (oq ^ cq) | (oq & ((e - s < 2) as u32));
+        opened += oq;
+        *x = Fd::new(s + oq as usize, e - oq as usize);
+    }
+    bad == 0 && 2 * opened == quotes
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]

@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map::Entry;
 use std::fs::File;
-use std::hash::{BuildHasher, Hash};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU32,
@@ -459,11 +459,59 @@ fn fmix64(mut h: u64) -> u64 {
     h ^ (h >> 33)
 }
 
-/// A re-mixed hash: the top 8 bits pick the shard, the low 24 the filter bit,
-/// and neither correlates with the bits the maps inside each shard use.
+/// The hasher behind `mix`: a multiply per 8-byte word (an 8-byte key costs
+/// one), then the high half folded into the low, since a multiply only mixes
+/// upward.
+struct MulHasher(u64);
+
+impl std::hash::Hasher for MulHasher {
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline(always)]
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64)
+    }
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64)
+    }
+    #[inline(always)]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64)
+    }
+    #[inline(always)]
+    fn write_u128(&mut self, i: u128) {
+        self.write_u64(i as u64);
+        self.write_u64((i >> 64) as u64);
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut c = bytes.chunks_exact(8);
+        for w in &mut c {
+            self.write_u64(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        let r = c.remainder();
+        if !r.is_empty() {
+            let mut b = [0u8; 8];
+            b[..r.len()].copy_from_slice(r);
+            self.write_u64(u64::from_le_bytes(b));
+        }
+    }
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+/// A key's hash: the top 8 bits pick the shard, the low bits index the link
+/// tables, bits 24.. a person shard's buckets.
 #[inline(always)]
 fn mix<T: Hash>(k: &T) -> u64 {
-    fmix64(FxBuildHasher.hash_one(k))
+    let mut h = MulHasher(0);
+    k.hash(&mut h);
+    std::hash::Hasher::finish(&h)
 }
 
 #[inline(always)]
@@ -1217,6 +1265,61 @@ fn f1_secs(_d: &[u8], _f: Fd) -> Option<i64> {
     None
 }
 
+/// A valid F1 timestamp (`ingest_ts` always is one) -> epoch seconds, checking
+/// only its length and the year's range (None: let the exact parsers decide).
+/// Needs f.s() + 32 <= d.len().
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f1_trusted(d: &[u8], f: Fd) -> Option<i64> {
+    use std::arch::x86_64::*;
+    if f.e() - f.s() != 20 || f.s() + 32 > d.len() {
+        return None;
+    }
+    // SAFETY: f.s() + 32 <= d.len().
+    let (a, b, se) = unsafe {
+        let v = _mm256_loadu_si256(d.as_ptr().add(f.s()) as *const __m256i);
+        let dg = _mm256_sub_epi8(v, _mm256_set1_epi8(0x30));
+        // Still the shape checked (digits and separators), cheaply; not the ranges.
+        let digit = _mm256_cmpeq_epi8(_mm256_min_epu8(dg, _mm256_set1_epi8(9)), dg);
+        let tmpl = _mm256_setr_epi8(
+            0, 0, 0, 0, 45, 0, 0, 45, 0, 0, 84, 0, 0, 58, 0, 0, 58, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let at_sep = _mm256_setr_epi8(
+            0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let ok = _mm256_blendv_epi8(digit, _mm256_cmpeq_epi8(v, tmpl), at_sep);
+        if (_mm256_movemask_epi8(ok) as u32) & 0xf_ffff != 0xf_ffff {
+            return None;
+        }
+        let sh = _mm256_setr_epi8(
+            0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+        let p = _mm256_maddubs_epi16(_mm256_shuffle_epi8(dg, sh), _mm256_set1_epi16(0x010a));
+        // [YY*100 + YY, MM*32 + DD, hh*60 + mm, 0 | ss, ...]
+        let q = _mm256_madd_epi16(p, _mm256_setr_epi16(100, 1, 32, 1, 60, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0));
+        let lo = _mm256_castsi256_si128(q);
+        (
+            _mm_cvtsi128_si64(lo) as u64,
+            _mm_extract_epi64::<1>(lo) as u64,
+            _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(q)) as i64,
+        )
+    };
+    let y = (a as u32) as i64;
+    let md = (a >> 32) as u32;
+    let (mo, dd) = ((md >> 5) as usize, (md & 31) as i64);
+    if !(TABLE_Y0..TABLE_Y0 + TABLE_YEARS as i64).contains(&y) || !(1..=12).contains(&mo) {
+        return None;
+    }
+    let start = MONTH_START[(y - TABLE_Y0) as usize * 12 + mo - 1] as i64;
+    Some(((start + dd - 1) * 1440 + (b as u32) as i64) * 60 + se)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn f1_trusted(d: &[u8], f: Fd) -> Option<i64> {
+    f1_secs(d, f)
+}
+
 /// `ts_at`, with F1 by `f1_secs` first.
 #[inline(always)]
 fn ts_fast(d: &[u8], f: Fd) -> Option<i64> {
@@ -1567,6 +1670,57 @@ fn main() {
             }
         }
         eprintln!("scanbench {m}: {tot}");
+        std::process::exit(0);
+    }
+    // EVBENCH=n: only the event-line work up to stage n (instruction counts).
+    if let Ok(m) = std::env::var("EVBENCH") {
+        let m: u32 = m.parse().unwrap();
+        let maps = map_dir(&data.join("events"));
+        let mut tot = 0u64;
+        for mm in &maps {
+            let d = &mm[..];
+            dense::each_line::<7>(d, true, |fl| {
+                if fl[0].empty() {
+                    return;
+                }
+                tot = tot.wrapping_add(fl[6].e() as u64);
+                if m < 2 {
+                    return;
+                }
+                let Some(id) = <Lid as Key>::make_eq(d, fl[0].s(), fl[0].e()) else { return };
+                tot = tot.wrapping_add(id.0);
+                if m < 3 {
+                    return;
+                }
+                let Some(ing) = f1_secs(d, fl[3]) else { return };
+                tot = tot.wrapping_add(ing as u64);
+                if m < 4 {
+                    return;
+                }
+                let Some(ts) = ts_fast(d, fl[2]) else { return };
+                tot = tot.wrapping_add(ts as u64);
+                if m < 5 {
+                    return;
+                }
+                let price = match purchase_kind(fld(d, fl[4])) {
+                    Some(false) => 0,
+                    Some(true) => parse_price(fld(d, fl[6])).unwrap_or(0),
+                    None => return,
+                };
+                tot = tot.wrapping_add(price as u64);
+                if m < 6 {
+                    return;
+                }
+                let Some(uid) = <Lid as Key>::make_late(d, fl[1].s(), fl[1].e()) else { return };
+                tot = tot.wrapping_add(uid.0);
+                if m < 7 {
+                    return;
+                }
+                let h = mix(&uid);
+                tot = tot.wrapping_add(h);
+            });
+        }
+        eprintln!("evbench {m}: {tot}");
         std::process::exit(0);
     }
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
@@ -2417,7 +2571,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     return;
                 };
                 // ingest_ts is always F1 (rules); anything else goes to the wide path.
-                let ing_s = match f1_secs(d, fl[3]) {
+                let ing_s = match f1_trusted(d, fl[3]) {
                     Some(s) => s,
                     None => match ts_at(d, fl[3]) {
                         Some(ms) if ms % 1000 == 0 => ms / 1000,
@@ -3684,6 +3838,41 @@ mod scan_tests {
         out
     }
 
+    fn collect3<const N: usize>(d: &[u8], skip: bool) -> Vec<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        dense::each_line::<N>(d, skip, |fl: &[Fd; N]| out.push(fl.iter().map(|f| (f.s(), f.e())).collect()));
+        out
+    }
+
+    #[test]
+    fn line_splitter_matches_the_reference() {
+        let mut r = Rng(0x5eed_f00d_8765_4321);
+        let mut lines_seen = 0;
+        for case in 0..40_000 {
+            let len = (r.next() % 900) as usize;
+            let quote_rate = [0, 2, 8, 30][case % 4];
+            let comma_rate = [8, 14, 22][case % 3];
+            let d: Vec<u8> = (0..len)
+                .map(|_| match r.next() % 100 {
+                    x if x < quote_rate => b'"',
+                    x if x < quote_rate + comma_rate => b',',
+                    x if x < quote_rate + comma_rate + 2 => b'\n',
+                    x if x < 90 => b"abcxyz0129"[(r.next() % 10) as usize],
+                    _ => b"-:TZ+. "[(r.next() % 7) as usize],
+                })
+                .collect();
+            for skip in [false, true] {
+                let a = nonempty_first(collect3::<4>(&d, skip));
+                assert_eq!(a, nonempty_first(collect::<4>(&d, skip, false)), "N=4 skip={skip} {:?}", String::from_utf8_lossy(&d));
+                lines_seen += a.len();
+                let a = nonempty_first(collect3::<7>(&d, skip));
+                assert_eq!(a, nonempty_first(collect::<7>(&d, skip, false)), "N=7 skip={skip} {:?}", String::from_utf8_lossy(&d));
+                lines_seen += a.len();
+            }
+        }
+        assert!(lines_seen > 5000, "the test should accept real lines too ({lines_seen})");
+    }
+
     fn nonempty_first(v: Vec<Vec<(usize, usize)>>) -> Vec<Vec<(usize, usize)>> {
         v.into_iter().filter(|l| l[0].0 < l[0].1).collect()
     }
@@ -3752,3 +3941,5 @@ mod scan_tests {
         assert!(lines_seen > 1000, "the test should accept real lines too ({lines_seen})");
     }
 }
+
+
