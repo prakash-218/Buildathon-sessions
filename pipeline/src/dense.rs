@@ -423,7 +423,7 @@ fn split_line<const N: usize>(_d: &[u8], _ls: usize) -> Option<(Option<[Fd; N]>,
 
 /// Every well-formed line of a chunk, as N fields, to `row` (one call site, so it is inlined).
 #[inline(always)]
-fn each_line<const N: usize>(d: &[u8], skip_first: bool, mut row: impl FnMut(&[Fd; N])) {
+pub(crate) fn each_line<const N: usize>(d: &[u8], skip_first: bool, mut row: impl FnMut(&[Fd; N])) {
     let mut ls = if skip_first { memchr(b'\n', d).map_or(d.len(), |i| i + 1) } else { 0 };
     while ls < d.len() {
         let (fl, next) = match split_line::<N>(d, ls) {

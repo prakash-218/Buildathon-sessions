@@ -1494,7 +1494,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let (ws, we) = (inp.ws, inp.we);
     let fail = AtomicBool::new(false);
     let Some(cat) = Catalog::<K>::load(inp) else { return false };
-    let Catalog { ref cat_names, ncat, ref campaigns, ncamp, ref camp_rows, .. } = cat;
+    let Catalog { ref cat_names, ncat, ncamp, ref camp_rows, .. } = cat;
     let category_of = |d: &'a [u8], f: Fd| cat.category_of(d, f);
     let organic = ncamp; // index of "organic"
     let target = chunk_target(inp, threads);
@@ -1554,7 +1554,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 v.push(PRec { name, ts: e.ts, price: e.price, cat: e.cat });
                 drec[shard_of(&e.id)].push(DRec { id: e.id, ingest: e.ingest, loc });
             };
-            scan::<7, _>(d, c.skip_first, |fl| {
+            dense::each_line::<7>(d, c.skip_first, |fl| {
                 if fl[0].empty() {
                     return;
                 }
@@ -1562,22 +1562,22 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     fail.store(true, Relaxed);
                     return;
                 };
-                let ingest = parse_ts(&d[fl[3].s()..fl[3].e()]).unwrap_or(i64::MAX);
+                let ingest = ts_fast(d, fl[3]).unwrap_or(i64::MAX);
                 'v: {
                     if fl[1].empty() || fl[5].empty() {
                         break 'v;
                     }
-                    let Some(ts) = parse_ts(&d[fl[2].s()..fl[2].e()]) else { break 'v };
+                    let Some(ts) = ts_fast(d, fl[2]) else { break 'v };
                     if ts < ws || ts >= we {
                         break 'v;
                     }
-                    let price = match &d[fl[4].s()..fl[4].e()] {
-                        b"view" | b"cart" => 0,
-                        b"purchase" => match parse_price(&d[fl[6].s()..fl[6].e()]) {
+                    let price = match purchase_kind(fld(d, fl[4])) {
+                        Some(false) => 0,
+                        Some(true) => match parse_price(fld(d, fl[6])) {
                             Some(p) => p,
                             None => break 'v,
                         },
-                        _ => break 'v,
+                        None => break 'v,
                     };
                     if ingest.saturating_sub(ts) > DAY {
                         break 'v; // late
@@ -1588,7 +1588,9 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                     };
                     let h = mix(&uid);
                     table_of(h).prefetch(h);
-                    let e = EvPend { id, uid, ingest, ts, h, price, cat: category_of(d, fl[5]) };
+                    // Categories only matter for purchases (top_category sums purchase prices).
+                    let cat = if price > 0 { category_of(d, fl[5]) } else { 0 };
+                    let e = EvPend { id, uid, ingest, ts, h, price, cat };
                     if queued == AHEAD {
                         finish(&ring[head], &mut pay, &mut drec);
                         ring[head] = e;
@@ -1631,14 +1633,14 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                 let p = if name == uid { (*h >> 56) as usize & (NB - 1) } else { shard_of(&name) };
                 out[p].push(CRec { name, ..*c });
             };
-            scan::<4, _>(d, c.skip_first, |fl| {
+            dense::each_line::<4>(d, c.skip_first, |fl| {
                 if fl[0].empty() || fl[1].empty() || fl[2].empty() {
                     return;
                 }
-                let Some(camp) = K::make(d, fl[2].s(), fl[2].e()).and_then(|k| campaigns.get(&k).copied()) else {
+                let Some(camp) = cat.campaign_of(d, fl[2]) else {
                     return;
                 };
-                let Some(ts) = parse_ts(&d[fl[3].s()..fl[3].e()]) else { return };
+                let Some(ts) = ts_fast(d, fl[3]) else { return };
                 if ts < ws - WEEK || ts >= we {
                     return;
                 }
