@@ -62,6 +62,19 @@ trait Key<'a>: Copy + Eq + Ord + Hash + Send + Sync + Default {
     fn make_late(d: &'a [u8], s: usize, e: usize) -> Option<Self> {
         Self::make(d, s, e)
     }
+    /// `make_eq`, but leaving any checking of the key to the caller: a key
+    /// that stands for a longer ID (a `Lid` digest) comes with that ID.
+    #[inline(always)]
+    fn make_eq2(d: &'a [u8], s: usize, e: usize) -> Option<(Self, Option<Id>)> {
+        Self::make(d, s, e).map(|k| (k, None))
+    }
+    /// Room in this thread's list of IDs met by `make_late` for about `n` more.
+    fn reserve_late(_n: usize) {}
+    /// Whether the key is a digest of a longer ID (then `make_eq2` gave it).
+    #[inline(always)]
+    fn is_long(self) -> bool {
+        false
+    }
     /// Called once events and clicks are parsed, before any key made by
     /// `make_late` is ordered or written out.
     fn settle() {}
@@ -336,6 +349,21 @@ fn lid_digest(id: &Id) -> u64 {
 
 impl<'a> Key<'a> for Lid {
     const UNIQUE: bool = true;
+    #[inline(always)]
+    fn make_eq2(d: &'a [u8], s: usize, e: usize) -> Option<(Lid, Option<Id>)> {
+        if e - s <= 9 {
+            return <u64 as Key>::make(d, s, e).map(|k| (Lid(k), None));
+        }
+        let id = Id::make(d, s, e)?;
+        Some((Lid(lid_digest(&id)), Some(id)))
+    }
+    #[inline(always)]
+    fn is_long(self) -> bool {
+        self.0 & LID_LONG != 0
+    }
+    fn reserve_late(n: usize) {
+        LID_LOCAL.with(|p| p.borrow_mut().late.reserve(n));
+    }
     #[inline(always)]
     fn grp(self) -> u64 {
         self.0
@@ -2531,24 +2559,40 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let ev_chunks = make_chunks(&inp.events, target);
     let ev_bytes: usize = inp.events.iter().map(|b| b.len()).sum();
     let ev_cap = shard_cap(ev_bytes / threads, 72);
-    type EvT<K> = (Vec<Vec<Dup<K>>>, Vec<Vec<Pay<K>>>);
+    // Long event IDs (a Lid digest) also go to a side list of their event_id
+    // shard, in their Dup records' order: dedup compares the full IDs of two
+    // copies with one digest, which is the whole check that digests do not clash.
+    type EvT<K> = (Vec<Vec<Dup<K>>>, Vec<Vec<Pay<K>>>, Vec<Vec<Id>>);
+    let late_guess = ev_bytes / threads / 80 / 6 + 1024;
     let ev_out: Vec<EvT<K>> = dense::per_thread(
         ev_chunks.len(),
         threads,
-        |_| -> EvT<K> { ((0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(), (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect()) },
-        |(drec_t, pay_t), chunk| {
+        |_| -> EvT<K> {
+            K::reserve_late(late_guess);
+            (
+                (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
+                (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
+                (0..NB).map(|_| Vec::new()).collect(),
+            )
+        },
+        |(drec_t, pay_t, side_t), chunk| {
             let c = ev_chunks[chunk];
             let d = c.data;
             let mut drec = std::mem::take(drec_t);
             let mut pay = std::mem::take(pay_t);
+            let mut side = std::mem::take(side_t);
             dense::each_line::<7>(d, c.skip_first, |fl| {
                 if fl[0].empty() {
                     return;
                 }
-                let Some(id) = K::make_eq(d, fl[0].s(), fl[0].e()) else {
+                let Some((id, long)) = K::make_eq2(d, fl[0].s(), fl[0].e()) else {
                     fail.store(true, Relaxed);
                     return;
                 };
+                let ds = shard_of(&id);
+                if let Some(l) = long {
+                    side[ds].push(l);
+                }
                 // ingest_ts is always F1 (rules); anything else goes to the wide path.
                 let ing_s = match f1_trusted(d, fl[3]) {
                     Some(s) => s,
@@ -2598,17 +2642,25 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
                         return;
                     }
                     v.push(Pay { name: uid, ts: (ts - ws) as u32, pc: price | cat << 24 });
-                    drec[shard_of(&id)].push(Dup { id, ingest, loc: (p as u32) << LOC_BITS | i as u32 });
+                    drec[ds].push(Dup { id, ingest, loc: (p as u32) << LOC_BITS | i as u32 });
                     return;
                 }
                 // An invalid copy: no payload, but it still takes part in dedup.
-                drec[shard_of(&id)].push(Dup { id, ingest, loc: NOLOC });
+                drec[ds].push(Dup { id, ingest, loc: NOLOC });
             });
             *drec_t = drec;
             *pay_t = pay;
+            *side_t = side;
         },
     );
-    let (drecs, pays): (Vec<Vec<Vec<Dup<K>>>>, Vec<Vec<Vec<Pay<K>>>>) = ev_out.into_iter().unzip();
+    let mut drecs: Vec<Vec<Vec<Dup<K>>>> = Vec::with_capacity(threads);
+    let mut pays: Vec<Vec<Vec<Pay<K>>>> = Vec::with_capacity(threads);
+    let mut sides: Vec<Vec<Vec<Id>>> = Vec::with_capacity(threads);
+    for (dr, py, sd) in ev_out {
+        drecs.push(dr);
+        pays.push(py);
+        sides.push(sd);
+    }
     log(t0, &format!("events parsed ({} chunks)", ev_chunks.len()));
 
     // ---- Clicks: parse + validate, shard by user ID.
@@ -2618,7 +2670,10 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let clicks: Vec<Vec<Vec<Clk<K>>>> = dense::per_thread(
         cl_chunks.len(),
         threads,
-        |_| (0..NB).map(|_| Vec::with_capacity(cl_cap)).collect::<Vec<Vec<Clk<K>>>>(),
+        |_| {
+            K::reserve_late(cl_bytes / threads / 45 / 3 + 1024);
+            (0..NB).map(|_| Vec::with_capacity(cl_cap)).collect::<Vec<Vec<Clk<K>>>>()
+        },
         |out_t, chunk| {
             let c = cl_chunks[chunk];
             let d = c.data;
@@ -2644,9 +2699,9 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
         },
     );
     let links = links_handle.join().unwrap();
-    (drecs, pays, clicks, links)
+    (drecs, pays, sides, clicks, links)
     });
-    let (drecs, mut pays, mut clicks, links_opt) = links_out;
+    let (drecs, mut pays, sides, mut clicks, links_opt) = links_out;
     if fail.load(Relaxed) || bail.load(Relaxed) {
         return false;
     }
@@ -2665,7 +2720,7 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     let kill = |at: u64| {
         let loc = at as u32;
         if loc != NOLOC {
-            let (c, p, i) = ((at >> 32) as usize, (loc >> LOC_BITS) as usize, (loc & ((1 << LOC_BITS) - 1)) as usize);
+            let (c, p, i) = ((at >> 32) as usize & 0xff, (loc >> LOC_BITS) as usize, (loc & ((1 << LOC_BITS) - 1)) as usize);
             // SAFETY: (c, p, i) is in bounds (it was that payload's index when pushed and
             // `pays` is not touched until dedup ends), and only the one dedup task that
             // owns this event_id's shard ever writes this element.
@@ -2681,11 +2736,20 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             best.reserve(n);
             for (t, c) in drecs.iter().enumerate() {
                 let tt = (t as u64) << 32;
+                let side = &sides[t][b];
+                let mut si = 0u64;
                 for r in &c[b] {
-                    let at = tt | r.loc as u64;
+                    let mut at = tt | r.loc as u64;
+                    if r.id.is_long() {
+                        at |= si << 40;
+                        si += 1;
+                    }
                     match best.entry(r.id) {
                         Entry::Occupied(mut e) => {
                             let (bi, bl) = *e.get();
+                            if r.id.is_long() && side[(at >> 40) as usize] != sides[(bl >> 32) as usize & 0xff][b][(bl >> 40) as usize] {
+                                LID_CLASH.store(true, Relaxed); // two long event IDs, one digest
+                            }
                             if r.ingest < bi {
                                 kill(bl);
                                 *e.get_mut() = (r.ingest, at);
