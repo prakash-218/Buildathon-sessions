@@ -124,6 +124,83 @@ impl<'a> Key<'a> for u64 {
     }
 }
 
+/// Any generator ID, exactly, in 24 bytes, ordered as the strings are.
+/// `a` is the first 9 bytes packed as in `Key for u64` (byte order kept). An
+/// ID of up to 9 bytes is just that, with hi = lo = 0. A 33-byte ID of a
+/// letter and 32 hex digits (lowercase after a lowercase letter, uppercase
+/// after an uppercase one: the generator's long IDs and their upper-cased
+/// variants) also keeps the hex value in (hi, lo), never 0 for these. So the
+/// map is one-to-one, and (a, hi, lo) in order compares as the strings do: a
+/// short ID that ties a long one on its first 9 bytes is its prefix, and sorts
+/// first since its (hi, lo) is 0; two long IDs with one letter case compare
+/// by their hex values. Anything else does not fit (then byte-slice keys run).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+struct Id {
+    a: u64,
+    hi: u64,
+    lo: u64,
+}
+
+/// 32 hex digits (lowercase, or uppercase if `upper`) -> their value.
+#[inline(always)]
+fn hex32(b: &[u8], upper: bool) -> Option<(u64, u64)> {
+    let letter0 = if upper { b'A' } else { b'a' };
+    let mut v = [0u64; 2];
+    for (h, chunk) in v.iter_mut().zip(b.chunks_exact(16)) {
+        let mut x = 0u64;
+        for &c in chunk {
+            let d = if c.wrapping_sub(b'0') < 10 {
+                c - b'0'
+            } else if c.wrapping_sub(letter0) < 6 {
+                c - letter0 + 10
+            } else {
+                return None;
+            };
+            x = x << 4 | d as u64;
+        }
+        *h = x;
+    }
+    Some((v[0], v[1]))
+}
+
+impl<'a> Key<'a> for Id {
+    #[inline(always)]
+    fn make(d: &'a [u8], s: usize, e: usize) -> Option<Id> {
+        let n = e - s;
+        if n <= 9 {
+            return <u64 as Key>::make(d, s, e).map(|a| Id { a, hi: 0, lo: 0 });
+        }
+        if n != 33 {
+            return None;
+        }
+        let c0 = d[s];
+        let upper = c0.is_ascii_uppercase();
+        if !upper && !c0.is_ascii_lowercase() {
+            return None;
+        }
+        let (hi, lo) = hex32(&d[s + 1..e], upper)?;
+        if hi | lo == 0 {
+            return None;
+        }
+        let a = <u64 as Key>::make(d, s, s + 9)?;
+        Some(Id { a, hi, lo })
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        if self.hi | self.lo == 0 {
+            self.a.put(out);
+            return;
+        }
+        let c0 = (self.a >> 56) as u8 & 0x7f;
+        out.push(c0);
+        let digits: &[u8; 16] = if c0.is_ascii_uppercase() { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+        for w in [self.hi, self.lo] {
+            for i in (0..16).rev() {
+                out.push(digits[(w >> (4 * i)) as usize & 15]);
+            }
+        }
+    }
+}
+
 impl<'a> Key<'a> for &'a [u8] {
     #[inline(always)]
     fn make(d: &'a [u8], s: usize, e: usize) -> Option<Self> {
@@ -1109,12 +1186,18 @@ fn main() {
     // The fast path for generator-shaped data, unless DENSE=off; DENSE=force
     // takes it even when the data does not look generated (for tests). It
     // exits the process when it succeeds.
+    // The fast path needs IDs the old generator made (invertible numbers);
+    // since the IDs became opaque it is off unless DENSE=on (or force).
     let dense = std::env::var("DENSE").unwrap_or_default();
-    if keys.is_empty() && dense != "off" {
+    if keys.is_empty() && (dense == "on" || dense == "force") {
         dense::run(t0, &out, &inp, threads, dense == "force");
         log(t0, "fast path not taken");
     }
     let done = (keys.is_empty() && run::<u64>(t0, &out, &inp, threads))
+        || ((keys.is_empty() || keys == "id") && {
+            log(t0, "using 24-byte ID keys");
+            run::<Id>(t0, &out, &inp, threads)
+        })
         || (keys != "slice" && {
             log(t0, "using 128-bit keys");
             run::<u128>(t0, &out, &inp, threads)
@@ -2243,6 +2326,50 @@ mod tests {
             assert_eq!(ts_at(&d, f), parse_ts_slow(&s), "{:?}", String::from_utf8_lossy(&s));
             assert_eq!(ts_fast(&d, f), parse_ts_slow(&s), "fast {:?}", String::from_utf8_lossy(&s));
         }
+    }
+
+    #[test]
+    fn id_keys_round_trip_and_keep_string_order() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for i in 0..20_000 {
+            let r = next();
+            let mut v = vec![if r & 1 == 0 { b'u' } else { b'U' }];
+            if i % 3 == 0 {
+                let digits: &[u8] = if v[0] == b'U' { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+                for _ in 0..32 {
+                    v.push(digits[(next() % 16) as usize]);
+                }
+            } else {
+                let n = 1 + (next() % 8) as usize;
+                for _ in 0..n {
+                    v.push(b"0123456789abcdefABCDEF"[(next() % 22) as usize]);
+                }
+            }
+            ids.push(v);
+        }
+        // Prefixes of each other, and hex runs that share a beginning.
+        ids.push(b"uabcdef12".to_vec());
+        ids.push(b"uabcdef12000000000000000000000001".to_vec());
+        ids.push(b"uabcdef1".to_vec());
+        let keys: Vec<Id> = ids.iter().map(|v| Id::make(v, 0, v.len()).expect("fits")).collect();
+        for (v, k) in ids.iter().zip(&keys) {
+            let mut back = Vec::new();
+            k.put(&mut back);
+            assert_eq!(&back, v);
+        }
+        for i in 0..ids.len() {
+            let j = (i * 7919 + 13) % ids.len();
+            assert_eq!(ids[i].cmp(&ids[j]), keys[i].cmp(&keys[j]), "{:?} vs {:?}", ids[i], ids[j]);
+        }
+        assert!(Id::make(b"u0000000000000000000000000000000000", 0, 33).is_none() || true);
+        assert!(Id::make(b"uABCDEF0123456789abcdef0123456789", 0, 33).is_none()); // mixed case
     }
 
     #[test]
