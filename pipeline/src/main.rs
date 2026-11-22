@@ -1635,15 +1635,22 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     // straight into its person's shard; every copy also sends (id, ingest, where
     // its payload is) to its event_id shard for dedup.
     let ev_chunks = make_chunks(&inp.events, target);
-    assert!(ev_chunks.len() < 1 << 24, "too many chunks for DRec::loc");
-    let ev_out: Vec<(Vec<Vec<DRec<K>>>, Vec<Vec<PRec<K>>>)> = ev_chunks
-        .par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
+    // One set of shard buffers per thread (not per chunk), sized for the
+    // thread's share of the input, so they are allocated once and rarely grow.
+    // A payload's location is then (thread, shard, index).
+    let ev_bytes: usize = inp.events.iter().map(|b| b.len()).sum();
+    let ev_cap = shard_cap(ev_bytes / threads, 72);
+    type EvT<K> = (usize, Vec<Vec<DRec<K>>>, Vec<Vec<PRec<K>>>);
+    let ev_out: Vec<EvT<K>> = dense::per_thread(
+        ev_chunks.len(),
+        threads,
+        |t| (t, (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(), (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect()),
+        |(t, drec_t, pay_t), chunk| {
+            let ci = *t;
+            let c = ev_chunks[chunk];
             let d = c.data;
-            let cap = shard_cap(d.len(), 72);
-            let mut drec: Vec<Vec<DRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
-            let mut pay: Vec<Vec<PRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            let mut drec = std::mem::take(drec_t);
+            let mut pay = std::mem::take(pay_t);
             // Valid copies wait AHEAD rows in this ring while their person's table
             // slot is prefetched; then `finish` looks the person up and stores them.
             let mut ring = [EvPend::<K>::default(); AHEAD];
@@ -1711,23 +1718,28 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             for k in 0..queued {
                 finish(&ring[(head + k) % AHEAD], &mut pay, &mut drec);
             }
-            (drec, pay)
-        })
-        .collect();
+            *drec_t = drec;
+            *pay_t = pay;
+        },
+    );
     if fail.load(Relaxed) {
         return false;
     }
-    let (drecs, mut pays): (Vec<_>, Vec<_>) = ev_out.into_iter().unzip();
+    let (drecs, mut pays): (Vec<_>, Vec<_>) = ev_out.into_iter().map(|(_, d, p)| (d, p)).unzip();
     log(t0, &format!("events parsed ({} chunks)", ev_chunks.len()));
 
     // ---- Clicks: parse + validate, shard by person.
     let cl_chunks = make_chunks(&inp.clicks, target);
-    let clicks: Vec<Vec<Vec<CRec<K>>>> = cl_chunks
-        .par_iter()
-        .map(|c| {
+    let cl_bytes: usize = inp.clicks.iter().map(|b| b.len()).sum();
+    let cl_cap = shard_cap(cl_bytes / threads, 46);
+    let clicks: Vec<Vec<Vec<CRec<K>>>> = dense::per_thread(
+        cl_chunks.len(),
+        threads,
+        |_| (0..NB).map(|_| Vec::with_capacity(cl_cap)).collect::<Vec<Vec<CRec<K>>>>(),
+        |out_t, chunk| {
+            let c = cl_chunks[chunk];
             let d = c.data;
-            let cap = shard_cap(d.len(), 46);
-            let mut out: Vec<Vec<CRec<K>>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
+            let mut out = std::mem::take(out_t);
             // Same prefetch ring as for events: (click, user id hash) waits AHEAD rows.
             let mut ring = [(CRec::<K>::default(), 0u64); AHEAD];
             let (mut head, mut queued) = (0usize, 0usize);
@@ -1767,9 +1779,9 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
             for k in 0..queued {
                 finish(&ring[(head + k) % AHEAD], &mut out);
             }
-            out
-        })
-        .collect();
+            *out_t = out;
+        },
+    );
     if fail.load(Relaxed) {
         return false;
     }
