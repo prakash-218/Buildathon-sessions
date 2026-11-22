@@ -227,6 +227,84 @@ impl<'a> Key<'a> for Id {
     }
 }
 
+/// IDs as 8 bytes, exactly. An ID of up to 9 bytes is its `Key for u64`
+/// packing (top bit 0). A long ID (one an `Id` holds with a hex value) is the
+/// top bit and a 63-bit digest of it, and the ID itself goes in a registry
+/// (one entry per digest), so it can be compared and written out. A digest
+/// shared by two different IDs is noticed there (`LID_CLASH`); the run then
+/// writes nothing and is redone with `Id` keys. Equality and hashing are on
+/// the 8 bytes; order is the strings' (via the registry for long IDs).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct Lid(u64);
+
+const LID_LONG: u64 = 1 << 63;
+const LID_SHARDS: usize = 256;
+static LID_REG: std::sync::OnceLock<Vec<std::sync::Mutex<FxHashMap<u64, Id>>>> = std::sync::OnceLock::new();
+static LID_CLASH: AtomicBool = AtomicBool::new(false);
+
+fn lid_reg() -> &'static Vec<std::sync::Mutex<FxHashMap<u64, Id>>> {
+    LID_REG.get_or_init(|| (0..LID_SHARDS).map(|_| std::sync::Mutex::new(FxHashMap::default())).collect())
+}
+
+impl Lid {
+    /// The ID this key stands for.
+    fn id(self) -> Id {
+        if self.0 & LID_LONG == 0 {
+            Id { a: self.0, hi: 0, lo: 0 }
+        } else {
+            let shard = &lid_reg()[(self.0 >> 32) as usize % LID_SHARDS];
+            *shard.lock().unwrap().get(&self.0).expect("registered long ID")
+        }
+    }
+}
+
+impl PartialOrd for Lid {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Lid {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if (self.0 | other.0) & LID_LONG == 0 {
+            self.0.cmp(&other.0) // both short: the packing keeps byte order
+        } else {
+            self.id().cmp(&other.id())
+        }
+    }
+}
+
+impl<'a> Key<'a> for Lid {
+    #[inline(always)]
+    fn make(d: &'a [u8], s: usize, e: usize) -> Option<Lid> {
+        if e - s <= 9 {
+            return <u64 as Key>::make(d, s, e).map(Lid);
+        }
+        let id = Id::make(d, s, e)?;
+        let digest = fmix64(id.hi ^ id.lo.rotate_left(29) ^ id.a.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | LID_LONG;
+        let shard = &lid_reg()[(digest >> 32) as usize % LID_SHARDS];
+        let mut m = shard.lock().unwrap();
+        match m.entry(digest) {
+            Entry::Occupied(o) => {
+                if *o.get() != id {
+                    LID_CLASH.store(true, Relaxed);
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert(id);
+            }
+        }
+        Some(Lid(digest))
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        if self.0 & LID_LONG == 0 {
+            self.0.put(out);
+        } else {
+            self.id().put(out);
+        }
+    }
+}
+
 impl<'a> Key<'a> for &'a [u8] {
     #[inline(always)]
     fn make(d: &'a [u8], s: usize, e: usize) -> Option<Self> {
@@ -1219,7 +1297,7 @@ fn main() {
         dense::run(t0, &out, &inp, threads, dense == "force");
         log(t0, "fast path not taken");
     }
-    let done = (keys.is_empty() && run::<u64>(t0, &out, &inp, threads))
+    let done = (keys.is_empty() && run::<Lid>(t0, &out, &inp, threads) && !LID_CLASH.load(Relaxed))
         || ((keys.is_empty() || keys == "id") && {
             log(t0, "using 24-byte ID keys");
             run::<Id>(t0, &out, &inp, threads)
@@ -1763,7 +1841,12 @@ fn run<'a, K: Key<'a>>(t0: Instant, out: &Path, inp: &Inputs<'a>, threads: usize
     .collect();
     log(t0, "sessions done");
 
-    // ---- Write.
+    // ---- Write. (Not if two long IDs shared a Lid digest: then the run is
+    // redone with exact Id keys.)
+    if LID_CLASH.load(Relaxed) {
+        log(t0, "long-ID digest clash; redoing with ID keys");
+        return false;
+    }
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
